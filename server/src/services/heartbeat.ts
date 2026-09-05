@@ -5408,12 +5408,6 @@ function enrichWakeContextSnapshot(input: {
   if (!readNonEmptyString(contextSnapshot["wakeSource"]) && source) {
     contextSnapshot.wakeSource = source;
   }
-  if (
-    !readNonEmptyString(contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY]) &&
-    readNonEmptyString(payload?.[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY])
-  ) {
-    contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = payload?.[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY];
-  }
   if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
   }
@@ -5523,9 +5517,6 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
-  if (readNonEmptyString(existing[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY])) {
-    merged[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = existing[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY];
-  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -12251,21 +12242,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const campaignRows = await client
       .select({
-        total: sql<number>`count(*)::integer`,
+        total: sql<number>`count(*) filter (where ${heartbeatRuns.contextSnapshot}->>'nativeModelReservation' = 'true')::integer`,
         firstStartedAt: sql<Date | null>`min(${heartbeatRuns.startedAt})`,
       })
       .from(heartbeatRuns)
-      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
       .where(and(
         eq(heartbeatRuns.companyId, run.companyId),
-        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'admissionAdapterType', ${agents.adapterType}) <> 'process'`,
+        sql`${heartbeatRuns.contextSnapshot}->>'nativeCampaignAdmission' = 'true'`,
         sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
         sql`${heartbeatRuns.startedAt} is not null`,
       ));
     const campaignRow = campaignRows[0];
     const campaignTotal = Number(campaignRow?.total ?? 0);
     const campaignStartedAt = campaignRow?.firstStartedAt ? new Date(campaignRow.firstStartedAt) : null;
-    const issueId = readNonEmptyString(context.issueId);
+    const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
 
     if (
       campaignStartedAt &&
@@ -12279,6 +12269,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
       };
     }
+    if (context.nativeModelReservation !== true) return null;
     if (campaignTotal >= INVOCATION_ADMISSION_DEFAULTS.maxStartsPerCampaign) {
       return {
         reason: "heartbeat.campaign_invocation_limit",
@@ -12293,12 +12284,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const issueRows = await client
         .select({ total: sql<number>`count(*)::integer` })
         .from(heartbeatRuns)
-      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
         .where(and(
           eq(heartbeatRuns.companyId, run.companyId),
-        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'admissionAdapterType', ${agents.adapterType}) <> 'process'`,
+          sql`${heartbeatRuns.contextSnapshot}->>'nativeModelReservation' = 'true'`,
           sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
           sql`${heartbeatRuns.startedAt} is not null`,
         ));
       const issueTotal = Number(issueRows[0]?.total ?? 0);
@@ -12314,32 +12304,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return null;
-  }
-
-  async function inheritInvocationAdmissionCampaignId(
-    companyId: string,
-    issueId: string,
-    contextSnapshot: Record<string, unknown>,
-  ) {
-    const priorRun = await db
-      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, companyId),
-        sql`${heartbeatRuns.startedAt} is not null`,
-        or(
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}`,
-        ),
-        sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} is not null`,
-      ))
-      .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    const campaignId = readNonEmptyString(
-      parseObject(priorRun?.contextSnapshot)[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY],
-    );
-    if (campaignId) contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = campaignId;
   }
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -12697,45 +12661,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
     const admission = await db.transaction(async (tx) => {
-      // Serialize lineage binding and quota admission together, including conflicting IDs.
-      const lockKey = `${INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX}${run.companyId}`;
-      if (lockKey) {
+      const heartbeatConfig = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+      const campaignId = readNonEmptyString(heartbeatConfig.campaignId)?.trim() ?? null;
+      const admissionContext = { ...parseObject(run.contextSnapshot) };
+      delete admissionContext.campaignId;
+      delete admissionContext.admissionAdapterType;
+      delete admissionContext.nativeCampaignAdmission;
+      delete admissionContext.nativeModelReservation;
+      if (campaignId) {
+        admissionContext.campaignId = campaignId;
+        admissionContext.nativeCampaignAdmission = true;
+        admissionContext.nativeModelReservation = !(agent.adapterType === "process" && heartbeatConfig.coordinationOnly === true);
+        const lockKey = `${INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX}${run.companyId}:${campaignId}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
       }
-
-      const admissionContext = parseObject(run.contextSnapshot);
-      const admissionIssueId = readNonEmptyString(admissionContext.issueId)
-        ?? readNonEmptyString(admissionContext.taskId);
-      const prior = admissionIssueId ? await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-        .from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, run.companyId),
-          sql`${heartbeatRuns.startedAt} is not null`,
-          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${admissionIssueId}`,
-        )).orderBy(heartbeatRuns.startedAt, heartbeatRuns.createdAt).limit(1)
-        .then((rows) => rows[0]) : null;
-      const wake = run.wakeupRequestId ? await tx.select().from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, run.wakeupRequestId)).then((rows) => rows[0]) : null;
-      const nativeParent = wake?.requestedByActorType === "agent" && wake.requestedByActorId
-        ? await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.companyId, run.companyId),
-            eq(heartbeatRuns.agentId, wake.requestedByActorId), eq(heartbeatRuns.status, "running")))
-          .orderBy(desc(heartbeatRuns.startedAt)).limit(1).then((rows) => rows[0])
-        : null;
-      // Existing lineage always wins. A fresh board attempt requires a fresh issue;
-      // arbitrary wake/comment strings never reset a bound issue.
-      admissionContext.campaignId = readNonEmptyString(parseObject(prior?.contextSnapshot).campaignId)
-        ?? readNonEmptyString(parseObject(nativeParent?.contextSnapshot).campaignId)
-        ?? (wake?.requestedByActorType === "user" ? readNonEmptyString(admissionContext.campaignId) : null)
-        ?? `issue:${admissionIssueId ?? run.id}`;
       run = { ...run, contextSnapshot: admissionContext };
-      const admissionBlock = agent.adapterType === "process" ? null
-        : await getInvocationAdmissionBlock(run, tx, claimedAt);
+      const admissionBlock = await getInvocationAdmissionBlock(run, tx, new Date());
       if (admissionBlock) {
         const reason = `Cancelled before adapter invocation because the ${admissionBlock.reason} admission cap was reached`;
         const cancelled = await tx
           .update(heartbeatRuns)
           .set({
             status: "cancelled",
+            contextSnapshot: run.contextSnapshot,
             finishedAt: claimedAt,
             error: reason,
             errorCode: admissionBlock.reason,
@@ -12769,7 +12717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "running",
           responsibleUserId,
-          contextSnapshot: { ...parseObject(run.contextSnapshot), admissionAdapterType: agent.adapterType },
+          contextSnapshot: run.contextSnapshot,
           startedAt: run.startedAt ?? claimedAt,
           updatedAt: claimedAt,
         })
@@ -17776,7 +17724,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
-    if (issueId) await inheritInvocationAdmissionCampaignId(agent.companyId, issueId, enrichedContextSnapshot);
 
     const writeSkippedRequest = async (
       skipReason: string,

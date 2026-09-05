@@ -409,40 +409,6 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThanOrEqual(now.getTime());
   });
 
-  it("inherits a prior issue campaign for assignment and comment-style wakes", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const issueId = randomUUID();
-    const campaignId = "acceptance-inherited-campaign";
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Inherited campaign work",
-      status: "in_progress",
-      priority: "high",
-      assigneeAgentId: agentId,
-    });
-    await db.insert(heartbeatRuns).values({
-      id: randomUUID(),
-      companyId,
-      agentId,
-      invocationSource: "automation",
-      status: "succeeded",
-      startedAt: new Date(Date.now() - 60_000),
-      finishedAt: new Date(),
-      contextSnapshot: { issueId, campaignId },
-    });
-
-    const run = await heartbeat.wakeup(agentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_commented",
-      payload: { issueId },
-    });
-
-    expect(run?.contextSnapshot).toMatchObject({ issueId, campaignId });
-    await heartbeat.drainActiveRunExecutions();
-  });
-
   it("allows generic timer wakes when the agent has assigned todo work", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
@@ -968,10 +934,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
-  it("blocks the seventh queued start for one issue at the native admission seam", async () => {
+  it.each(["codex_local", "process"])("blocks seventh native reservation for %s despite spoofed campaign", async (adapterType) => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
+    await db.update(agents).set({ adapterType }).where(eq(agents.id, agentId));
     const issueId = randomUUID();
     const campaignId = "acceptance-issue-cap";
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { campaignId, maxConcurrentRuns: 2, coordinationOnly: adapterType !== "process" } } }).where(eq(agents.id, agentId));
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -989,7 +957,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         status: "succeeded",
         startedAt: new Date(Date.now() - 60_000),
         finishedAt: new Date(),
-        contextSnapshot: { issueId, campaignId },
+        contextSnapshot: { issueId, campaignId, nativeCampaignAdmission: true, nativeModelReservation: true },
       });
     }
     const queued = await seedQueuedRun({
@@ -1018,6 +986,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
     const issueId = randomUUID();
     const campaignId = "acceptance-issue-cap";
+    await db.update(agents).set({ adapterType: "process", runtimeConfig: { heartbeat: { campaignId, coordinationOnly: true } } }).where(eq(agents.id, agentId));
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -1035,7 +1004,53 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         status: "succeeded",
         startedAt: new Date(Date.now() - 60_000),
         finishedAt: new Date(),
-        contextSnapshot: { issueId, campaignId, admissionAdapterType: i === 0 ? "process" : "codex_local" },
+        contextSnapshot: { issueId, campaignId, nativeCampaignAdmission: true, nativeModelReservation: true },
+      });
+    }
+    const queued = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_continuation_needed",
+      invocationSource: "automation",
+      contextExtras: { campaignId: "untrusted-reset-attempt" },
+    });
+    await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queued.runId));
+    expect(run?.status).toBe("succeeded");
+  });
+
+  it("ignores caller campaign opt-in when no saved actor campaign exists", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
+    const issueId = randomUUID();
+    const campaignId = "acceptance-issue-cap";
+    await db.update(agents).set({ runtimeConfig: {} }).where(eq(agents.id, agentId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capped issue work",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    for (let i = 0; i < 6; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        startedAt: new Date(Date.now() - 60_000),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId, campaignId, nativeCampaignAdmission: true, nativeModelReservation: true },
       });
     }
     const queued = await seedQueuedRun({
@@ -1063,6 +1078,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
     const issueId = randomUUID();
     const campaignId = "acceptance-budget-expired";
+    await db.update(agents).set({ adapterType: "process", runtimeConfig: { heartbeat: { campaignId, coordinationOnly: true } } }).where(eq(agents.id, agentId));
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -1080,7 +1096,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       createdAt: new Date(Date.now() - 46 * 60_000),
       startedAt: new Date(Date.now() - 46 * 60_000),
       finishedAt: new Date(Date.now() - 45 * 60_000),
-      contextSnapshot: { issueId, campaignId },
+      contextSnapshot: { issueId, campaignId, nativeCampaignAdmission: true, nativeModelReservation: false },
     });
     const queued = await seedQueuedRun({
       companyId,
@@ -1109,6 +1125,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   it("serializes concurrent campaign admissions so the campaign cap cannot be exceeded", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
     const campaignId = "acceptance-campaign-cap";
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { campaignId, maxConcurrentRuns: 2 } } }).where(eq(agents.id, agentId));
     for (let i = 0; i < 23; i += 1) {
       await db.insert(heartbeatRuns).values({
         id: randomUUID(),
@@ -1118,11 +1135,15 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         status: "succeeded",
         startedAt: new Date(Date.now() - 60_000),
         finishedAt: new Date(),
-        contextSnapshot: { campaignId, issueId: randomUUID() },
+        contextSnapshot: { campaignId, issueId: randomUUID(), nativeCampaignAdmission: true, nativeModelReservation: true },
       });
     }
+    const [template] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values({ ...template!, id: peerAgentId, name: "Campaign peer" });
     const queued = [];
     for (let i = 0; i < 2; i += 1) {
+      const workerId = i === 0 ? agentId : peerAgentId;
       const issueId = randomUUID();
       await db.insert(issues).values({
         id: issueId,
@@ -1130,11 +1151,11 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         title: `Concurrent campaign issue ${i}`,
         status: "in_progress",
         priority: "high",
-        assigneeAgentId: agentId,
+        assigneeAgentId: workerId,
       });
       const run = await seedQueuedRun({
         companyId,
-        agentId,
+        agentId: workerId,
         issueId,
         wakeReason: "issue_assigned",
         invocationSource: "assignment",

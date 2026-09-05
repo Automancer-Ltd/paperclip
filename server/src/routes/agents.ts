@@ -1705,6 +1705,11 @@ export function agentRoutes(
   }
 
   function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat);
+    if (req.actor.type === "agent" && heartbeat &&
+      (hasOwn(heartbeat, "campaignId") || hasOwn(heartbeat, "coordinationOnly"))) {
+      throw forbidden("Campaign admission settings are board-managed");
+    }
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
       assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
     }
@@ -3028,6 +3033,7 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/config-revisions/:revisionId/rollback", async (req, res) => {
+    if (req.actor.type === "agent") throw forbidden("Configuration rollback is board-managed");
     const id = req.params.id as string;
     const revisionId = req.params.revisionId as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
@@ -3755,6 +3761,12 @@ export function agentRoutes(
       return;
     }
 
+    const savedHeartbeat = asRecord(asRecord(existing.runtimeConfig)?.heartbeat);
+    if (req.actor.type === "agent" && savedHeartbeat &&
+      (hasOwn(savedHeartbeat, "campaignId") || hasOwn(savedHeartbeat, "coordinationOnly")) &&
+      (hasOwn(req.body, "runtimeConfig") || hasOwn(req.body, "adapterType") || hasOwn(req.body, "adapterConfig"))) {
+      throw forbidden("Campaign actor execution settings are board-managed");
+    }
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;

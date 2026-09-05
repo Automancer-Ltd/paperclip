@@ -145,7 +145,7 @@ const externalAdapter: ServerAdapterModule = {
 
 const missingAdapterType = "missing_adapter_validation_test";
 
-async function createApp() {
+async function createApp(actor?: Record<string, unknown>) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -153,7 +153,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -297,6 +297,16 @@ describe("agent routes adapter validation", () => {
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
   });
+
+  it.each([{ heartbeat: { campaignId: "reset" } }, { heartbeat: { coordinationOnly: true } }, {}])(
+    "refuses agent edits to a saved campaign even when config permissions allow them (%j)", async (runtimeConfig) => {
+      mockAgentService.getById.mockResolvedValue({ id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: { heartbeat: { campaignId: "trusted" } } });
+      const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_key" });
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ runtimeConfig }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    },
+  );
 
   it("creates agents for dynamically registered external adapter types", async () => {
     const { registerServerAdapter } = await import("../adapters/index.js");
