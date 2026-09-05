@@ -998,7 +998,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       issueId,
       wakeReason: "issue_continuation_needed",
       invocationSource: "automation",
-      contextExtras: { campaignId },
+      contextExtras: { campaignId: "untrusted-reset-attempt" },
     });
     await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
 

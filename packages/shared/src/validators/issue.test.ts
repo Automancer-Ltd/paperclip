@@ -271,7 +271,6 @@ describe("issue validators", () => {
       metadata: {
         version: 1,
         sourceRunId: "11111111-1111-4111-8111-111111111111",
-        campaignId: "acceptance-route-campaign",
         sections: [
           {
             title: "Evidence",
@@ -293,7 +292,6 @@ describe("issue validators", () => {
     expect(parsed.presentation?.detailsDefaultOpen).toBe(false);
     expect(parsed.presentation?.density).toBe("compact");
     expect(parsed.metadata?.sourceRunId).toBe("11111111-1111-4111-8111-111111111111");
-    expect(parsed.metadata?.campaignId).toBe("acceptance-route-campaign");
     expect(parsed.metadata?.sections[0]?.rows).toHaveLength(3);
     expect(parsed.metadata?.sections[0]?.rows[2]).toMatchObject({
       type: "run_link",
