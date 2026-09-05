@@ -4401,7 +4401,8 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    (input.issueExecutionWorkspacePreference === "reuse_existing" ||
+      input.issueExecutionWorkspacePreference === "isolated_workspace") && requestedExecutionWorkspaceId !== null;
 
   return {
     requestedExecutionWorkspaceId,
@@ -4459,6 +4460,7 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
 
 export async function provisionExecutionWorkspaceForFreshnessDecision<T extends { warnings?: string[] }>(input: {
   requestedShouldReuseExisting: boolean;
+  reuseIsOptional?: boolean;
   existingExecutionWorkspaceId?: string | null;
   issueRef: WorkspaceReuseIssueRef;
   runId: string;
@@ -4502,6 +4504,15 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
     });
   }
 
+  // Isolated reuse is optional when the old workspace is gone, never when restoration threw.
+  if (!restored && !reuseFailure && input.reuseIsOptional === true) {
+    const executionWorkspace = await input.realizeWorkspace();
+    return { executionWorkspace, reusedExecutionWorkspace: null,
+      policy: resolveExecutionWorkspaceReuseProvisioningPolicy({
+        requestedShouldReuseExisting: false, workspaceConfigFreshness: input.workspaceConfigFreshness,
+      }),
+    };
+  }
   if (!restored) {
     reuseFailure = reuseFailure ?? formatInheritedExecutionWorkspaceReuseFailure({
       reason: "inherited_workspace_reuse_unavailable",
@@ -12669,19 +12680,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const heartbeatConfig = parseObject(parseObject(agent.runtimeConfig).heartbeat);
     const campaignId = readNonEmptyString(heartbeatConfig.campaignId)?.trim() ?? null;
     const claim = async (tx: Pick<Db, "select" | "update" | "execute">) => {
-      const admissionContext = { ...parseObject(run.contextSnapshot) };
-      delete admissionContext.campaignId;
-      delete admissionContext.admissionAdapterType;
-      delete admissionContext.nativeCampaignAdmission;
-      delete admissionContext.nativeModelReservation;
+      const admissionFlags: Record<string, unknown> = {};
       if (campaignId) {
-        admissionContext.campaignId = campaignId;
-        admissionContext.nativeCampaignAdmission = true;
-        admissionContext.nativeModelReservation = !(agent.adapterType === "process" && heartbeatConfig.coordinationOnly === true);
+        admissionFlags.campaignId = campaignId;
+        admissionFlags.nativeCampaignAdmission = true;
+        admissionFlags.nativeModelReservation = !(agent.adapterType === "process" && heartbeatConfig.coordinationOnly === true);
         const lockKey = `${INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX}${run.companyId}:${campaignId}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
       }
-      run = { ...run, contextSnapshot: admissionContext };
+      const admissionContext = { ...parseObject(run.contextSnapshot) };
+      for (const key of ["campaignId", "admissionAdapterType", "nativeCampaignAdmission", "nativeModelReservation"]) {
+        delete admissionContext[key];
+      }
+      run = { ...run, contextSnapshot: { ...admissionContext, ...admissionFlags } };
+      // Coalesced wakes can update the row after it was fetched. Only replace our flags.
+      const currentAdmissionContext = sql`(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb)
+        - 'campaignId' - 'admissionAdapterType' - 'nativeCampaignAdmission' - 'nativeModelReservation')
+        || ${JSON.stringify(admissionFlags)}::jsonb`;
       const admissionBlock = await getInvocationAdmissionBlock(run, tx, new Date());
       if (admissionBlock) {
         const reason = `Cancelled before adapter invocation because the ${admissionBlock.reason} admission cap was reached`;
@@ -12689,7 +12704,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(heartbeatRuns)
           .set({
             status: "cancelled",
-            contextSnapshot: run.contextSnapshot,
+            contextSnapshot: currentAdmissionContext,
             finishedAt: claimedAt,
             error: reason,
             errorCode: admissionBlock.reason,
@@ -12723,7 +12738,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "running",
           responsibleUserId,
-          contextSnapshot: run.contextSnapshot,
+          contextSnapshot: currentAdmissionContext,
           startedAt: run.startedAt ?? claimedAt,
           updatedAt: claimedAt,
         })
@@ -15030,6 +15045,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
+        reuseIsOptional: issueRef?.executionWorkspacePreference !== "reuse_existing",
         existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
         issueRef,
         runId: run.id,
@@ -15263,9 +15279,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (issueId && persistedExecutionWorkspace) {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
       const shouldSwitchIssueToExistingWorkspace =
-        issueRef?.executionWorkspacePreference === "reuse_existing" ||
-        requestedExecutionWorkspaceMode === "isolated_workspace" ||
-        requestedExecutionWorkspaceMode === "operator_branch";
+        issueRef?.executionWorkspacePreference === "reuse_existing";
       const nextIssuePatch: Record<string, unknown> = {};
       if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
         nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
@@ -17736,6 +17750,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
+      // Preserve the installed terminal wake guard and one-hour skipped-wake throttle.
+            if (issueId && isUuidLike(issueId) && opts.requestedByActorType !== "user") {
+                const localPatchIssueStatus = await db
+                    .select({ status: issues.status })
+                    .from(issues)
+                    .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)))
+                    .then((rows) => rows[0]?.status ?? null);
+                if (localPatchIssueStatus === "done" || localPatchIssueStatus === "cancelled") {
+                    return;
+                }
+                const localPatchRecentSkip = await db
+                    .select({ id: agentWakeupRequests.id })
+                    .from(agentWakeupRequests)
+                    .where(and(eq(agentWakeupRequests.companyId, agent.companyId), sql `${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`, eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, skipReason), gte(agentWakeupRequests.createdAt, new Date(Date.now() - 60 * 60 * 1000))))
+                    .limit(1)
+                    .then((rows) => rows[0] ?? null);
+                if (localPatchRecentSkip) {
+                    return;
+                }
+            }
+
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,

@@ -312,6 +312,8 @@ describe("agent routes adapter validation", () => {
 
   it.each([
     { name: "ordinary configuration", saved: {}, restored: {}, status: 200 },
+    { name: "cleared campaign", saved: { heartbeat: { campaignId: null, coordinationOnly: false } }, restored: {}, status: 200 },
+    { name: "blank campaign", saved: { heartbeat: { campaignId: "  " } }, restored: {}, status: 200 },
     { name: "removing a campaign", saved: { heartbeat: { campaignId: "trusted" } }, restored: {}, status: 403 },
     { name: "restoring campaign settings", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, status: 403 },
   ])("scopes agent rollback protection to campaign settings: $name", async ({ saved, restored, status }) => {

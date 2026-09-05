@@ -1,0 +1,73 @@
+[
+  {
+    "package": "server",
+    "tarball": "https://registry.npmjs.org/@paperclipai/server/-/server-2026.824.1.tgz",
+    "comparedJsFiles": 420,
+    "changed": [
+      {
+        "path": "dist/services/execution-workspace-policy.js",
+        "stockSha256": "4bf2df4ef2e145b0a0fe46c9392034c252dbcb7aac342313ce329bee160fe438",
+        "liveSha256": "d371328f1d58c37510ebb98eefe04ddc3c959d57ba92144e3a1679dfdd0e205d"
+      },
+      {
+        "path": "dist/services/heartbeat.js",
+        "stockSha256": "5f75718e79a305b0c1ce740e896b742fd5a881a6649e2546286fd674d60f35e8",
+        "liveSha256": "45805a54f92f8b4d24fcb2e8d5ccb2ee7831b07c11ffb218e508dc385ff2443f"
+      },
+      {
+        "path": "dist/services/recovery/issue-graph-liveness.js",
+        "stockSha256": "3712581aa2d96b25bd4041f655c94ddc2baf1ab52e3795122c4efa61461993ee",
+        "liveSha256": "709b4a8b4964b64cfedeab789a2d2184d63f8d91371a7101b54cd8bdc2b69353"
+      },
+      {
+        "path": "dist/services/issue-thread-interactions.js",
+        "stockSha256": "a22bdf1d4c92a2248007e6cdc683b6a6ac5e4edc9f1937c2e7d9208a3cac37ed",
+        "liveSha256": "21b31fd8772fe96ad444d4cad78c14cc3c4122e7c3dff155e1a63caa8d754558"
+      },
+      {
+        "path": "dist/services/issues.js",
+        "stockSha256": "b5a84850d2f4595b022f93809f4e755c82e4fd053452fc2b7fe5323ef3599923",
+        "liveSha256": "778b04fefc4fbef26ae76807695e54b9aeec683c8802214b3d50ef3465bc046f"
+      },
+      {
+        "path": "dist/services/routines.js",
+        "stockSha256": "ccee6270b97b6b7a78333e066ba033dbde77dc4403e360251d00d4c5099db48c",
+        "liveSha256": "facf568e62635edad99e9dc25baea83e7b133869f434c396d9da19e016af0955"
+      },
+      {
+        "path": "dist/services/recovery/service.js",
+        "stockSha256": "71bcc89fd32e7ba082851324d72b4f5a9b28fe1b783c5edf830102352dc77bfa",
+        "liveSha256": "c083977d8b83b8d776350c21099b936197de04ee2a6d12bef0ce8a30622e30eb"
+      }
+    ]
+  },
+  {
+    "package": "adapter-utils",
+    "tarball": "https://registry.npmjs.org/@paperclipai/adapter-utils/-/adapter-utils-2026.824.1.tgz",
+    "comparedJsFiles": 61,
+    "changed": [
+      {
+        "path": "dist/acpx-engine/execute.js",
+        "stockSha256": "a8445586635dba8d54f83ded341bf2a57e4493c4243845edc4365c1107ae2214",
+        "liveSha256": "0370f6196c0f424abb186afc243cd82003817404b125670b865536c9e652baa3"
+      }
+    ]
+  },
+  {
+    "package": "adapter-codex-local",
+    "tarball": "https://registry.npmjs.org/@paperclipai/adapter-codex-local/-/adapter-codex-local-2026.824.1.tgz",
+    "comparedJsFiles": 59,
+    "changed": [
+      {
+        "path": "dist/server/acp.js",
+        "stockSha256": "a1bc2c4154907243344d41d9e5d4e3d5575ded6f56f318ae9d7274f2d62e729f",
+        "liveSha256": "6f9a95cfd9d44906a988f825b197c3928762b361bccf384341e96e2e15ab995d"
+      },
+      {
+        "path": "dist/server/execute.js",
+        "stockSha256": "5532dd7cfef4cc91fca965aa71c3882eed90a5aa302dd8505ebfc169fe31d611",
+        "liveSha256": "5928a0dbe25cccece3721aba269380293230f47ea1daaf8d8d0cf867243a12f3"
+      }
+    ]
+  }
+]

@@ -365,6 +365,7 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  sessionEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -2172,6 +2173,7 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    sessionEnv: resolveAcpSessionEnv(env),
     loggedEnv,
     stateDir,
     permissionMode,
@@ -2266,9 +2268,60 @@ async function applySessionConfigOptions(input: {
  * narrowed to string values. Shared by the remote concurrent bring-up and the
  * local / runner-less lane so both resolve the runtime env identically.
  */
+const ACP_INHERITED_SENSITIVE_ENV_KEY = /(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_?KEY)(?:$|_)/i;
+const ACP_INHERITED_SERVER_ONLY_ENV_KEYS = new Set([
+    "DATABASE_URL",
+    "DATABASE_MIGRATION_URL",
+    "PAPERCLIPAI_CMD",
+]);
+const ACP_INHERITED_PAPERCLIP_ENV_ALLOWLIST = new Set([
+    "PAPERCLIP_RUNTIME_API_URL",
+    "PAPERCLIP_LISTEN_HOST",
+    "PAPERCLIP_LISTEN_PORT",
+]);
+
+
+
+
+
+
+
+
+
+const ACP_INHERITED_ADAPTER_CREDENTIAL_ALLOWLIST = new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "CURSOR_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+]);
+
+function resolveAcpSessionEnv(env: Record<string, string>): Record<string, string> {
+    const neutralizedInheritedEnv: Record<string, string> = {};
+    for (const key of Object.keys(process.env)) {
+        if (key in env)
+            continue;
+        if (ACP_INHERITED_ADAPTER_CREDENTIAL_ALLOWLIST.has(key))
+            continue;
+        const isPaperclipServerEnv = key.startsWith("PAPERCLIP_") && !ACP_INHERITED_PAPERCLIP_ENV_ALLOWLIST.has(key);
+        if (isPaperclipServerEnv ||
+            ACP_INHERITED_SERVER_ONLY_ENV_KEYS.has(key) ||
+            ACP_INHERITED_SENSITIVE_ENV_KEY.test(key)) {
+            neutralizedInheritedEnv[key] = "";
+        }
+    }
+    return { ...neutralizedInheritedEnv, ...env };
+}
+
 function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv({ ...process.env, ...resolveAcpSessionEnv(env) })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -3521,7 +3574,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   mode: prepared.mode,
                   cwd: prepared.cwd,
                   resumeSessionId,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: { env: prepared.sessionEnv },
                 });
                 ensureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3552,7 +3605,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   agent: prepared.acpxAgent,
                   mode: prepared.mode,
                   cwd: prepared.cwd,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: { env: prepared.sessionEnv },
                 });
                 retryEnsureSessionMs = now() - ensureSessionStart;
                 return established;

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -47,6 +48,18 @@ vi.mock("../adapters/index.ts", async () => {
       execute: mockAdapterExecute,
     })),
   };
+});
+
+const beforeInvocationBudget = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../services/budgets.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/budgets.js")>("../services/budgets.js");
+  return { ...actual, budgetService: (...args: Parameters<typeof actual.budgetService>) => {
+    const service = actual.budgetService(...args);
+    return { ...service, getInvocationBlock: async (...input: Parameters<typeof service.getInvocationBlock>) => {
+      await beforeInvocationBudget();
+      return service.getInvocationBlock(...input);
+    } };
+  } };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -151,6 +164,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
   afterEach(async () => {
     await heartbeat.drainActiveRunExecutions();
+    beforeInvocationBudget.mockReset();
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -1108,6 +1122,45 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
+  it.each(["ordinary", "campaign", "capped"])("preserves a wake coalesced after claim fetched the queued row (%s)", async (mode) => {
+    const campaignId = mode === "ordinary" ? null : "coalesced-claim";
+    const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { campaignId } });
+    const issueId = randomUUID(), commentId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Coalesced claim", status: "in_progress", assigneeAgentId: agentId });
+    const queued = await seedQueuedRun({ companyId, agentId, issueId, wakeReason: "issue_assigned" });
+    await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
+    await db.insert(issueComments).values({ id: commentId, companyId, issueId, body: "Follow-up arriving during claim" });
+    if (mode === "capped") {
+      for (let i = 0; i < 6; i++) await db.insert(heartbeatRuns).values({
+        companyId, agentId, invocationSource: "automation", status: "succeeded",
+        startedAt: new Date(), finishedAt: new Date(),
+        contextSnapshot: { issueId, campaignId, nativeCampaignAdmission: true, nativeModelReservation: true },
+      });
+    }
+    let reached!: () => void, release!: () => void;
+    const fetched = new Promise<void>(resolve => { reached = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    beforeInvocationBudget.mockImplementationOnce(async () => { reached(); await gate; });
+    const claiming = heartbeat.resumeQueuedRuns();
+    try {
+      await fetched;
+      const coalesced = await heartbeat.wakeup(agentId, {
+        source: "on_demand", triggerDetail: "manual", payload: { issueId, commentId },
+      });
+      expect(coalesced?.id).toBe(queued.runId);
+      expect(coalesced?.contextSnapshot?.wakeCommentId).toBe(commentId);
+    } finally {
+      release();
+      await claiming;
+    }
+    await heartbeat.drainActiveRunExecutions();
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued.runId));
+    expect(row.contextSnapshot?.wakeCommentId).toBe(commentId);
+    expect(row.contextSnapshot?.wakeCommentIds).toContain(commentId);
+    expect(row.status).toBe(mode === "capped" ? "cancelled" : "succeeded");
+    expect(countExecuteCallsForRun(queued.runId)).toBe(mode === "capped" ? 0 : 1);
+  });
+
   it("serializes concurrent campaign admissions so the campaign cap cannot be exceeded", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
     const campaignId = "acceptance-campaign-cap";
@@ -1127,7 +1180,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const [template] = await db.select().from(agents).where(eq(agents.id, agentId));
     const peerAgentId = randomUUID();
     await db.insert(agents).values({ ...template!, id: peerAgentId, name: "Campaign peer" });
-    const queued = [];
+    const queued: string[] = [];
+    let peerIssueId = "";
     for (let i = 0; i < 2; i += 1) {
       const workerId = i === 0 ? agentId : peerAgentId;
       const issueId = randomUUID();
@@ -1139,6 +1193,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         priority: "high",
         assigneeAgentId: workerId,
       });
+      if (i === 1) { peerIssueId = issueId; continue; }
       const run = await seedQueuedRun({
         companyId,
         agentId: workerId,
@@ -1151,7 +1206,57 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       queued.push(run.runId);
     }
 
-    await Promise.all([heartbeat.resumeQueuedRuns(), heartbeat.resumeQueuedRuns()]);
+    let countQueries = 0, lockAttempts = 0;
+    let releaseCount!: () => void;
+    const countGate = new Promise<void>(resolve => { releaseCount = resolve; });
+    const transaction = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((callback, options) =>
+      transaction(async tx => {
+        const execute = tx.execute.bind(tx);
+        vi.spyOn(tx, "execute").mockImplementation(query => {
+          if ((typeof query === "string" ? query : new PgDialect().sqlToQuery(query.getSQL()).sql).includes("pg_advisory_xact_lock")) lockAttempts++;
+          return execute(query);
+        });
+        const select = tx.select.bind(tx);
+        vi.spyOn(tx, "select").mockImplementation(((fields: Parameters<typeof tx.select>[0]) => {
+          const builder = select(fields);
+          if (fields && "firstStartedAt" in fields) {
+            const from = builder.from.bind(builder);
+            vi.spyOn(builder, "from").mockImplementation((table: Parameters<typeof builder.from>[0]) => {
+              const selection = from(table);
+              const where = selection.where.bind(selection);
+              vi.spyOn(selection, "where").mockImplementation(condition => {
+                const query = where(condition);
+                return Promise.resolve(query).then(async rows => {
+                  countQueries++;
+                  if (countQueries === 1) await countGate;
+                  return rows;
+                }) as unknown as ReturnType<typeof where>;
+              });
+              return selection;
+            });
+          }
+          return builder;
+        }) as typeof tx.select);
+        return callback(tx);
+      }, options),
+    );
+    const firstClaim = heartbeat.resumeQueuedRuns();
+    let secondClaim: Promise<void> | undefined;
+    try {
+      expect(await waitForCondition(async () => countQueries === 1)).toBe(true);
+      secondClaim = heartbeat.wakeup(peerAgentId, {
+        source: "on_demand", triggerDetail: "manual", payload: { issueId: peerIssueId },
+      }).then(run => { expect(run).not.toBeNull(); queued.push(run!.id); });
+      expect(await waitForCondition(async () => lockAttempts >= 2 || countQueries >= 2)).toBe(true);
+      // The second claim has reached the lock, but cannot count until the first commits.
+      expect(lockAttempts).toBeGreaterThanOrEqual(2);
+      expect(countQueries).toBe(1);
+    } finally {
+      releaseCount();
+      await Promise.all([firstClaim, secondClaim]);
+      transactionSpy.mockRestore();
+    }
     await heartbeat.drainActiveRunExecutions();
 
     const rows = await db

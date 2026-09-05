@@ -7050,7 +7050,7 @@ export function issueService(db: Db) {
           (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
-          : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
+          : inheritExecutionWorkspaceFromIssueId ?? null;
         const hasExplicitExecutionWorkspaceOverride =
           issueData.executionWorkspaceId !== undefined ||
           issueData.executionWorkspacePreference !== undefined ||

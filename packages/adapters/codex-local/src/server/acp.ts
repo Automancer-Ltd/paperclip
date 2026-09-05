@@ -1,3 +1,30 @@
+import { readFileSync as nodeReadFileSync } from "node:fs";
+import nodeOs from "node:os";
+import nodePath from "node:path";
+function localPatchCodexHomeUsesChatgptAuth(env: NodeJS.ProcessEnv): boolean {
+    try {
+        const configured = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim().length > 0
+            ? env.CODEX_HOME.trim()
+            : nodePath.join(nodeOs.homedir(), ".codex");
+        const raw = nodeReadFileSync(nodePath.join(configured, "auth.json"), "utf8");
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object")
+            return false;
+        const embeddedKey = typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY.trim().length > 0;
+        if (embeddedKey)
+            return false;
+        const tokens = parsed.tokens;
+        const hasChatgptTokens = !!tokens
+            && typeof tokens === "object"
+            && typeof tokens.access_token === "string"
+            && tokens.access_token.trim().length > 0;
+        return parsed.auth_mode === "chatgpt" || hasChatgptTokens;
+    }
+    catch {
+        return false;
+    }
+}
+
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -331,7 +358,8 @@ export function resolveCodexAcpBillingIdentity(
     ),
   };
   const apiKey = typeof mergedEnv.OPENAI_API_KEY === "string" && mergedEnv.OPENAI_API_KEY.trim().length > 0;
-  const billingType: AdapterBillingType = apiKey ? "api" : "subscription";
+  const billsApi = apiKey && !(considerHostEnv && localPatchCodexHomeUsesChatgptAuth(mergedEnv));
+  const billingType: AdapterBillingType = billsApi ? "api" : "subscription";
   const openAiCompatibleBiller = inferOpenAiCompatibleBiller(mergedEnv, "openai");
   const biller =
     openAiCompatibleBiller === "openrouter"

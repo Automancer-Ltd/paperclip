@@ -82,7 +82,8 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
 }
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
-  return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
+  return Boolean(issue.executionWorkspaceId &&
+    (issue.executionWorkspacePreference === "reuse_existing" || issue.executionWorkspacePreference === "isolated_workspace"));
 }
 
 export function isUnrunnableWorktreeCombo(input: {

@@ -3046,7 +3046,7 @@ export function agentRoutes(
       }
       for (const config of [existing.runtimeConfig, asRecord(revision.afterConfig)?.runtimeConfig]) {
         const heartbeat = asRecord(asRecord(config)?.heartbeat);
-        if (heartbeat && (hasOwn(heartbeat, "campaignId") || hasOwn(heartbeat, "coordinationOnly"))) {
+        if ((typeof heartbeat?.campaignId === "string" && heartbeat.campaignId.trim().length > 0) || heartbeat?.coordinationOnly === true) {
           throw forbidden("Campaign actor configuration rollback is board-managed");
         }
       }
@@ -3775,7 +3775,7 @@ export function agentRoutes(
 
     const savedHeartbeat = asRecord(asRecord(existing.runtimeConfig)?.heartbeat);
     if (req.actor.type === "agent" && savedHeartbeat &&
-      (hasOwn(savedHeartbeat, "campaignId") || hasOwn(savedHeartbeat, "coordinationOnly")) &&
+      ((typeof savedHeartbeat.campaignId === "string" && savedHeartbeat.campaignId.trim().length > 0) || savedHeartbeat.coordinationOnly === true) &&
       (hasOwn(req.body, "runtimeConfig") || hasOwn(req.body, "adapterType") || hasOwn(req.body, "adapterConfig"))) {
       throw forbidden("Campaign actor execution settings are board-managed");
     }

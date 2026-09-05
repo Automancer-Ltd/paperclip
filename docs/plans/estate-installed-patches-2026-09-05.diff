@@ -1,0 +1,623 @@
+--- server/dist/services/heartbeat.js.stock-backup
++++ server/dist/services/heartbeat.js
+@@ -3040,7 +3040,14 @@
+ ];
+ export function resolveExecutionWorkspaceReuseRequestForIssue(input) {
+     const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
+-    const requestedShouldReuseExisting = input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
++    // LOCAL PATCH 2026-08-18 (re-port of 2026-07-30 workspace-pref patch):
++    // isolated_workspace issues resume their own persisted worktree instead of
++    // failing base-workspace validation (see hunk at
++    // shouldSwitchIssueToExistingWorkspace). Rollback:
++    // heartbeat.js.pre-workspace-pref-20260818.
++    const requestedShouldReuseExisting = (input.issueExecutionWorkspacePreference === "reuse_existing" ||
++        input.issueExecutionWorkspacePreference === "isolated_workspace") &&
++        requestedExecutionWorkspaceId !== null;
+     return {
+         requestedExecutionWorkspaceId,
+         requestedShouldReuseExisting,
+@@ -3107,6 +3114,24 @@
+             workspaceConfigFreshness: input.workspaceConfigFreshness,
+             cause: error,
+         });
++    }
++    // LOCAL PATCH 2026-08-26 (optional reuse). An isolated_workspace issue
++    // PREFERS its own persisted worktree; it must not be stranded when that
++    // worktree has been retired. Only an explicit reuse_existing binding keeps
++    // the fail-loud behaviour, because silently working elsewhere would be
++    // wrong there. A restore that actively THREW still fails (reuseFailure is
++    // already set) — this covers "the workspace is simply gone" only.
++    // Rollback: heartbeat.js.pre-optional-reuse-20260826.
++    if (!restored && !reuseFailure && input.reuseIsOptional === true) {
++        const executionWorkspace = await input.realizeWorkspace();
++        return {
++            executionWorkspace,
++            reusedExecutionWorkspace: null,
++            policy: resolveExecutionWorkspaceReuseProvisioningPolicy({
++                requestedShouldReuseExisting: false,
++                workspaceConfigFreshness: input.workspaceConfigFreshness,
++            }),
++        };
+     }
+     if (!restored) {
+         reuseFailure = reuseFailure ?? formatInheritedExecutionWorkspaceReuseFailure({
+@@ -11408,6 +11433,9 @@
+             });
+             const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } = await provisionExecutionWorkspaceForFreshnessDecision({
+                 requestedShouldReuseExisting,
++                // LOCAL PATCH 2026-08-26: reuse is REQUIRED only for an explicit
++                // reuse_existing binding. See provisionExecutionWorkspaceForFreshnessDecision.
++                reuseIsOptional: issueRef?.executionWorkspacePreference !== "reuse_existing",
+                 existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+                 issueRef,
+                 runId: run.id,
+@@ -11618,9 +11646,13 @@
+             }
+             if (issueId && persistedExecutionWorkspace) {
+                 const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
+-                const shouldSwitchIssueToExistingWorkspace = issueRef?.executionWorkspacePreference === "reuse_existing" ||
+-                    requestedExecutionWorkspaceMode === "isolated_workspace" ||
+-                    requestedExecutionWorkspaceMode === "operator_branch";
++                // LOCAL PATCH 2026-08-18 (workspace-pref rewrite bug, re-port of
++                // 2026-07-30 patch): do NOT flip an isolated_workspace issue's
++                // preference to reuse_existing after first realization — the
++                // reuse-resolution guard above now accepts isolated issues with a
++                // persisted workspace id directly. Rollback:
++                // heartbeat.js.pre-workspace-pref-20260818.
++                const shouldSwitchIssueToExistingWorkspace = issueRef?.executionWorkspacePreference === "reuse_existing";
+                 const nextIssuePatch = {};
+                 if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
+                     nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
+@@ -13778,6 +13810,37 @@
+         if (!agent)
+             throw notFound("Agent not found");
+         const writeSkippedRequest = async (skipReason, patch = {}) => {
++            // LOCAL PATCH 2026-09-01 (estate review lane D — wake-loop suppression).
++            // The periodic recovery sweeps re-dispatch the SAME non-terminal issue every
++            // 30 s indefinitely. Each pass lands here and mints another `skipped` row that
++            // never starts a run: 31,732 rows in 14 days, AUT-6626 alone 19,917 over 12
++            // days, AUT-6221 4,941 over 2 days. Two guards, both scoped to non-user
++            // requesters and issue-bound wakes only, so no dispatch semantics change:
++            //   (a) terminal-status guard — never mint a wake row for a done/cancelled issue;
++            //   (b) per-(issue, reason) re-wake throttle — at most one skip row per hour.
++            // Uses the existing agent_wakeup_requests_company_payload_issue_idx index.
++            // Upstream: recovery sweep has no per-issue backoff (see #9208 family).
++            // Backup: heartbeat.js.pre-wakeloop-throttle-20260901
++            if (issueId && isUuidLike(issueId) && opts.requestedByActorType !== "user") {
++                const localPatchIssueStatus = await db
++                    .select({ status: issues.status })
++                    .from(issues)
++                    .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)))
++                    .then((rows) => rows[0]?.status ?? null);
++                if (localPatchIssueStatus === "done" || localPatchIssueStatus === "cancelled") {
++                    return;
++                }
++                const localPatchRecentSkip = await db
++                    .select({ id: agentWakeupRequests.id })
++                    .from(agentWakeupRequests)
++                    .where(and(eq(agentWakeupRequests.companyId, agent.companyId), sql `${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`, eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, skipReason), gte(agentWakeupRequests.createdAt, new Date(Date.now() - 60 * 60 * 1000))))
++                    .limit(1)
++                    .then((rows) => rows[0] ?? null);
++                if (localPatchRecentSkip) {
++                    return;
++                }
++            }
++            // END LOCAL PATCH 2026-09-01
+             await db.insert(agentWakeupRequests).values({
+                 companyId: agent.companyId,
+                 agentId,
+--- server/dist/services/execution-workspace-policy.js.stock-backup
++++ server/dist/services/execution-workspace-policy.js
+@@ -48,7 +48,15 @@
+     return input.mode === "agent_default" ? "adapter_managed" : "project_primary";
+ }
+ export function hasReusableExecutionWorkspaceBinding(issue) {
+-    return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
++    // LOCAL PATCH 2026-08-26: an isolated_workspace issue with a persisted
++    // workspace has one to reuse just as a reuse_existing issue does. Keying on
++    // reuse_existing alone relied on dispatch rewriting the preference after the
++    // first run — the rewrite the workspace-pref patch removes. Without this an
++    // isolated issue with no project is rejected as an unrunnable worktree
++    // combo. Rollback: execution-workspace-policy.js.pre-isolated-binding-20260826.
++    return Boolean(issue.executionWorkspaceId &&
++        (issue.executionWorkspacePreference === "reuse_existing" ||
++            issue.executionWorkspacePreference === "isolated_workspace"));
+ }
+ export function isUnrunnableWorktreeCombo(input) {
+     if (input.resolvedMode !== "isolated_workspace" && input.resolvedMode !== "operator_branch")
+--- server/dist/services/issue-thread-interactions.js.stock-backup
++++ server/dist/services/issue-thread-interactions.js
+@@ -2056,6 +2056,13 @@
+             });
+             if (superseded.length === 0)
+                 return [];
++            // LOCAL PATCH 2026-08-18 (re-port of 2026-08-16 board-session patch;
++            // upstream #10402, still unfixed in 2026.817.0): a single user comment
++            // must never expire MULTIPLE sibling confirmations — ambiguous
++            // supersession silently destroyed a chosen confirmation (AUT-5232).
++            // Rollback: issue-thread-interactions.js.pre-supersede-guard-20260818.
++            if (superseded.length > 1)
++                return [];
+             const now = new Date();
+             const expired = [];
+             for (const row of superseded) {
+--- server/dist/services/issues.js.stock-backup
++++ server/dist/services/issues.js
+@@ -5393,7 +5393,12 @@
+                 let executionWorkspaceSettings = issueData.executionWorkspaceSettings ?? null;
+                 const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
+                     ? null
+-                    : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
++                    // LOCAL PATCH 2026-08-18 (re-port of 2026-08-16 patch; upstream #11464
++                    // + addendum, #4424, still unfixed in 2026.817.0): implicit parentId
++                    // fallback made children share/inherit worktrees (incl. cancelled
++                    // parents). Inheritance now requires the explicit field only.
++                    // Rollback: issues.js.pre-inheritance-guard-20260818.
++                    : inheritExecutionWorkspaceFromIssueId ?? null;
+                 const hasExplicitExecutionWorkspaceOverride = issueData.executionWorkspaceId !== undefined ||
+                     issueData.executionWorkspacePreference !== undefined ||
+                     issueData.executionWorkspaceSettings !== undefined;
+--- server/dist/services/recovery/service.js.stock-backup
++++ server/dist/services/recovery/service.js
+@@ -3465,6 +3465,13 @@
+                 title: agents.title,
+                 status: agents.status,
+                 reportsTo: agents.reportsTo,
++                // LOCAL PATCH 2026-09-04 (AUT-6971): liveness owner-selection needs
++                // these to exclude non-executing identity agents (e.g. a `process`
++                // adapter with no configured command) from candidate lists — see
++                // hasRunnableAdapterCommand in ./issue-graph-liveness.js. Backup:
++                // service.js.pre-runnable-identity-guard-20260904
++                adapterType: agents.adapterType,
++                adapterConfig: agents.adapterConfig,
+             })
+                 .from(agents),
+             db
+@@ -3911,6 +3918,45 @@
+         if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+             return { kind: "skipped" };
+         }
++        // LOCAL PATCH 2026-09-01 (estate review lane D — liveness re-escalation ceiling).
++        // The existing dedup only looks for an OPEN escalation, and the cooldown only
++        // looks back a fixed window. An escalation an agent cannot act on — a board
++        // gate, a permanently uninvokable assignee — is closed `done`, the cooldown
++        // lapses, and the sweep mints an identical one. Measured over 14 days: 147
++        // escalations, one incidentKey minted 33 times (all 33 `done`, none open), and
++        // AUT-2937 ("AL-CL1 production release gate — board review") took 77. That cost
++        // 180 runs and 4.5 h of run time and inflated the delivery figure, because the
++        // engine's own bookkeeping was being counted as completed work.
++        // Two guards:
++        //   (a) the source issue must still be in a live status — a done, cancelled or
++        //       deliberately backlogged issue is not stranded;
++        //   (b) a hard ceiling on escalations per incidentKey, counting every status.
++        //       Three attempts that all closed without clearing the incident is proof
++        //       the incident is not agent-clearable; a fourth is churn. The issue stays
++        //       blocked and visible rather than growing a new card every cooldown.
++        // Backup: service.js.pre-escalation-ceiling-20260901
++        const LOCAL_PATCH_LIVE_SOURCE_STATUSES = ["todo", "in_progress", "in_review", "blocked"];
++        if (!LOCAL_PATCH_LIVE_SOURCE_STATUSES.includes(issue.status)) {
++            return { kind: "skipped" };
++        }
++        const LOCAL_PATCH_MAX_ESCALATIONS_PER_INCIDENT = 3;
++        if (input.finding.incidentKey) {
++            const localPatchPriorEscalations = await db
++                .select({ n: sql `count(*)::int` })
++                .from(issues)
++                .where(and(eq(issues.companyId, issue.companyId), eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation), eq(issues.originId, input.finding.incidentKey)))
++                .then((rows) => Number(rows[0]?.n ?? 0));
++            if (localPatchPriorEscalations >= LOCAL_PATCH_MAX_ESCALATIONS_PER_INCIDENT) {
++                logger.warn({
++                    companyId: issue.companyId,
++                    issueId: issue.id,
++                    incidentKey: input.finding.incidentKey,
++                    priorEscalations: localPatchPriorEscalations,
++                }, "liveness re-escalation ceiling reached; not minting another escalation");
++                return { kind: "skipped" };
++            }
++        }
++        // END LOCAL PATCH 2026-09-01
+         const recoveryIssue = await db
+             .select()
+             .from(issues)
+--- server/dist/services/recovery/issue-graph-liveness.js.stock-backup
++++ server/dist/services/recovery/issue-graph-liveness.js
+@@ -11,8 +11,32 @@
+         status: issue.status,
+     };
+ }
++// LOCAL PATCH 2026-09-04 (AUT-6971 — non-executing identity agents picked as
++// liveness escalation owner). `isAgentInvokable` only checks agent STATUS
++// (active/idle/running/error) and org-chain health; it says nothing about
++// whether the agent can actually run work. `autodash-triage` is identity-only
++// (no adapter command, no skills, no routines, heartbeat disabled) yet has a
++// normal invokable status, so it was selected as an escalation owner and the
++// dispatch failed with "Process adapter missing command" (AUT-6959 run
++// 4ffea3a8-8041-4e89-9cda-1ed4bb90b9dc, 2026-08-24T23:48:02Z).
++// A `process`-adapter agent with no configured `adapterConfig.command` can
++// never execute a dispatched run — that is the literal cause of the failure,
++// and the only adapter shape where "command" is caller-configured rather than
++// adapter-managed. Other adapter types (codex_local, claude_local, etc.) run
++// a fixed, adapter-managed binary and are excluded from this check.
++// Backup: issue-graph-liveness.js.pre-runnable-identity-guard-20260904
++function hasRunnableAdapterCommand(agent) {
++    if (agent.adapterType !== "process")
++        return true;
++    const command = agent.adapterConfig?.command;
++    return typeof command === "string" && command.trim().length > 0;
++}
++// END LOCAL PATCH 2026-09-04
+ function isInvokableAgent(agent, agentsById) {
+-    return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
++    return Boolean(agent &&
++        isAgentInvokable({ agent, agents: [...agentsById.values()] }) &&
++        hasRunnableAdapterCommand(agent) // LOCAL PATCH 2026-09-04 (AUT-6971)
++    );
+ }
+ function hasActiveExecutionPath(companyId, issueId, activeRuns, queuedWakeRequests) {
+     return [...activeRuns, ...queuedWakeRequests].some((entry) => entry.companyId === companyId && entry.issueId === issueId);
+--- server/dist/services/routines.js.stock-backup
++++ server/dist/services/routines.js
+@@ -1162,6 +1162,55 @@
+         // It becomes inert once those legacy routine execution issues drain out.
+         return or(eq(issues.originFingerprint, dispatchFingerprint), eq(issues.originFingerprint, "default"));
+     }
++    // LOCAL PATCH 2026-09-01 (lane R3 — routine dispatch must defer, not destroy).
++    // Root cause: routine dispatch called queueIssueAssignmentWakeup with
++    // rethrowOnError:true. enqueueWakeup throws a 409 when the assignee is not
++    // invokable, so the catch below deleted the issue it had just created and
++    // recorded the run `failed`. Measured 2026-08-29..2026-09-01: 51 runs across 13
++    // routines destroyed that way — the Gmail intake channel lost 24 consecutive
++    // runs while Magnus sat paused. Every other caller of queueIssueAssignmentWakeup
++    // swallows the same refusal, so only routines lose their work.
++    // Fix: a refusal that will clear on its own (assignee paused / pending approval /
++    // unrecognised status, or a budget block) DEFERS the dispatch instead: the issue
++    // is kept, assigned, in todo, and the run is recorded `issue_created`. The next
++    // tick coalesces onto that untouched issue rather than minting a duplicate, which
++    // is the concurrencyPolicy `coalesce_if_active` intent. A terminated assignee or a
++    // broken reporting chain is a permanent misconfiguration and still fails loudly.
++    // Backup: routines.js.pre-routine-deferral-20260901
++    const LOCAL_PATCH_DEFERRABLE_WAKE_REASONS = new Set([
++        "paused",
++        "pending_approval",
++        "unknown_status",
++    ]);
++    function localPatchDeferrableWakeRefusal(error) {
++        if (!error || typeof error !== "object")
++            return null;
++        if (error.status !== 409)
++            return null;
++        const details = (error.details ?? {});
++        const reason = typeof details.reason === "string" ? details.reason : null;
++        if (reason && LOCAL_PATCH_DEFERRABLE_WAKE_REASONS.has(reason) && !details.invalidOrgChain)
++            return reason;
++        if (typeof details.scopeType === "string")
++            return "budget_blocked";
++        return null;
++    }
++    // An open execution issue for this routine that no heartbeat run has ever
++    // referenced: it was created by a dispatch whose wake was deferred and is still
++    // waiting to be picked up. Coalesce onto it instead of creating another.
++    async function findDeferredExecutionIssue(routine, executor = db, dispatchFingerprint, origin) {
++        const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
++        const originKind = origin?.kind ?? "routine_execution";
++        const originId = origin?.id ?? routine.id;
++        return executor
++            .select()
++            .from(issues)
++            .where(and(eq(issues.companyId, routine.companyId), eq(issues.originKind, originKind), eq(issues.originId, originId), inArray(issues.status, OPEN_ISSUE_STATUSES), visibleIssueCondition(), sql `not exists (select 1 from heartbeat_runs hr where hr.company_id = ${issues.companyId} and hr.context_snapshot ->> 'issueId' = cast(${issues.id} as text))`, ...(fingerprintCondition ? [fingerprintCondition] : [])))
++            .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
++            .limit(1)
++            .then((rows) => rows[0] ?? null);
++    }
++    // END LOCAL PATCH 2026-09-01 (lane R3)
+     async function findLiveExecutionIssue(routine, executor = db, dispatchFingerprint, origin) {
+         const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+         const originKind = origin?.kind ?? "routine_execution";
+@@ -1408,10 +1457,18 @@
+                     : undefined;
+             let createdIssue = null;
+             try {
+-                const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
++                const activeIssue = (await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+                     kind: issueOriginKind,
+                     id: issueOriginId,
+-                });
++                }))
++                    // LOCAL PATCH 2026-09-01 (lane R3): also coalesce onto an issue left
++                    // behind by a deferred dispatch, which has no live run to join to.
++                    ?? (input.routine.concurrencyPolicy === "always_enqueue"
++                        ? null
++                        : await findDeferredExecutionIssue(input.routine, txDb, dispatchFingerprint, {
++                            kind: issueOriginKind,
++                            id: issueOriginId,
++                        }));
+                 if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+                     const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+                     if (manualRunnerUserId) {
+@@ -1505,15 +1562,31 @@
+                     return updated ?? createdRun;
+                 }
+                 // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+-                await queueIssueAssignmentWakeup({
+-                    heartbeat,
+-                    issue: createdIssue,
+-                    reason: "issue_assigned",
+-                    mutation: "create",
+-                    contextSource: "routine.dispatch",
+-                    requestedByActorType: input.source === "schedule" ? "system" : undefined,
+-                    rethrowOnError: true,
+-                });
++                // LOCAL PATCH 2026-09-01 (lane R3): a refusal that clears by itself defers.
++                try {
++                    await queueIssueAssignmentWakeup({
++                        heartbeat,
++                        issue: createdIssue,
++                        reason: "issue_assigned",
++                        mutation: "create",
++                        contextSource: "routine.dispatch",
++                        requestedByActorType: input.source === "schedule" ? "system" : undefined,
++                        rethrowOnError: true,
++                    });
++                }
++                catch (wakeError) {
++                    const deferralReason = localPatchDeferrableWakeRefusal(wakeError);
++                    if (!deferralReason)
++                        throw wakeError;
++                    logger.warn({
++                        routineId: input.routine.id,
++                        runId: createdRun.id,
++                        issueId: createdIssue.id,
++                        assigneeAgentId: assigneeAgentId ?? null,
++                        deferralReason,
++                    }, "routine dispatch deferred: assignee could not be woken, issue kept for pickup when it can run");
++                }
++                // END LOCAL PATCH 2026-09-01 (lane R3)
+                 const updated = await finalizeRun(createdRun.id, {
+                     status: "issue_created",
+                     linkedIssueId: createdIssue.id,
+--- adapter-utils/dist/acpx-engine/execute.js.stock-backup
++++ adapter-utils/dist/acpx-engine/execute.js
+@@ -1520,6 +1520,9 @@
+         workspaceRepoUrl,
+         workspaceRepoRef,
+         env,
++        // LOCAL PATCH 2026-08-18: scrubbed env for ACP session establishment
++        // (see resolveAcpSessionEnv).
++        sessionEnv: resolveAcpSessionEnv(env),
+         loggedEnv,
+         stateDir,
+         permissionMode,
+@@ -1599,7 +1602,70 @@
+  * local / runner-less lane so both resolve the runtime env identically.
+  */
+ function resolveRuntimeEnv(env) {
+-    return Object.fromEntries(Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter((entry) => typeof entry[1] === "string"));
++    // LOCAL PATCH 2026-08-18: overlay the scrubbed session env so sensitive
++    // server-only values inherited from the Paperclip server process are
++    // neutralized in the launch env too (see resolveAcpSessionEnv below).
++    return Object.fromEntries(Object.entries(ensurePathInEnv({ ...process.env, ...resolveAcpSessionEnv(env) })).filter((entry) => typeof entry[1] === "string"));
++}
++// LOCAL PATCH 2026-08-18: env-scrub security patch (upstream acpx env
++// inheritance vuln, unfixed as of 2026.817.0 — acpx overlays session env onto
++// its own parent environment when spawning an agent, leaking Paperclip server
++// secrets to agent processes). Ported from the 2026.722.0 local patch
++// (backup: custom-layer/patched/.../acpx-engine/execute.js in
++// /opt/automancer/backups/paperclip-stock-upgrade-20260818).
++const ACP_INHERITED_SENSITIVE_ENV_KEY = /(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_?KEY)(?:$|_)/i;
++const ACP_INHERITED_SERVER_ONLY_ENV_KEYS = new Set([
++    "DATABASE_URL",
++    "DATABASE_MIGRATION_URL",
++    "PAPERCLIPAI_CMD",
++]);
++const ACP_INHERITED_PAPERCLIP_ENV_ALLOWLIST = new Set([
++    "PAPERCLIP_RUNTIME_API_URL",
++    "PAPERCLIP_LISTEN_HOST",
++    "PAPERCLIP_LISTEN_PORT",
++]);
++// LOCAL PATCH 2026-08-26 (adapter-credential allowlist). Upstream deliberately
++// lets a local adapter run inherit the HOST provider credential; the scrub
++// below neutralized those too, so an agent configured to use host credentials
++// would fail auth for a non-obvious reason. These are adapter-owned, not
++// Paperclip-server-owned, so they pass through. Note AWS_ACCESS_KEY_ID never
++// matched the pattern anyway; the Bedrock pair is listed for consistency and is
++// safe here only because this instance uses the local_encrypted secrets
++// provider (config.json secrets.provider) — revisit if it ever moves to AWS.
++// Rollback: execute.js.pre-adapter-cred-allowlist-20260826.
++const ACP_INHERITED_ADAPTER_CREDENTIAL_ALLOWLIST = new Set([
++    "ANTHROPIC_API_KEY",
++    "ANTHROPIC_AUTH_TOKEN",
++    "CLAUDE_CODE_OAUTH_TOKEN",
++    "OPENAI_API_KEY",
++    "GEMINI_API_KEY",
++    "GOOGLE_API_KEY",
++    "OPENROUTER_API_KEY",
++    "XAI_API_KEY",
++    "CURSOR_API_KEY",
++    "AWS_SECRET_ACCESS_KEY",
++    "AWS_SESSION_TOKEN",
++]);
++/**
++ * ACPX overlays session env onto its own parent environment when it spawns an
++ * agent. Neutralize sensitive values inherited from the Paperclip server while
++ * preserving every value Paperclip explicitly resolved for this run.
++ */
++function resolveAcpSessionEnv(env) {
++    const neutralizedInheritedEnv = {};
++    for (const key of Object.keys(process.env)) {
++        if (key in env)
++            continue;
++        if (ACP_INHERITED_ADAPTER_CREDENTIAL_ALLOWLIST.has(key))
++            continue; // LOCAL PATCH 2026-08-26: adapter-owned host credential
++        const isPaperclipServerEnv = key.startsWith("PAPERCLIP_") && !ACP_INHERITED_PAPERCLIP_ENV_ALLOWLIST.has(key);
++        if (isPaperclipServerEnv ||
++            ACP_INHERITED_SERVER_ONLY_ENV_KEYS.has(key) ||
++            ACP_INHERITED_SENSITIVE_ENV_KEY.test(key)) {
++            neutralizedInheritedEnv[key] = "";
++        }
++    }
++    return { ...neutralizedInheritedEnv, ...env };
+ }
+ /**
+  * Bring up the two host-side sandbox bridges concurrently and settle both.
+@@ -2693,7 +2759,7 @@
+                                     mode: prepared.mode,
+                                     cwd: prepared.cwd,
+                                     resumeSessionId,
+-                                    sessionOptions: { env: prepared.env },
++                                    sessionOptions: { env: prepared.sessionEnv }, // LOCAL PATCH 2026-08-18 env-scrub
+                                 });
+                                 ensureSessionMs = now() - ensureSessionStart;
+                                 return established;
+@@ -2723,7 +2789,7 @@
+                                     agent: prepared.acpxAgent,
+                                     mode: prepared.mode,
+                                     cwd: prepared.cwd,
+-                                    sessionOptions: { env: prepared.env },
++                                    sessionOptions: { env: prepared.sessionEnv }, // LOCAL PATCH 2026-08-18 env-scrub
+                                 });
+                                 retryEnsureSessionMs = now() - ensureSessionStart;
+                                 return established;
+--- adapter-codex-local/dist/server/acp.js.stock-backup
++++ adapter-codex-local/dist/server/acp.js
+@@ -1,3 +1,6 @@
++import { readFileSync as nodeReadFileSync } from "node:fs";
++import nodeOs from "node:os";
++import nodePath from "node:path";
+ import fs from "node:fs/promises";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+@@ -228,6 +231,46 @@
+         },
+     };
+ }
++// LOCAL PATCH 2026-09-01 (lane R3 — bill Codex by the auth it actually uses).
++// `resolveCodexBillingType` inferred API billing from the mere presence of an
++// OPENAI_API_KEY environment variable. On 2026-08-24 23:01 the OpenAI *admin* key
++// (bws AUT_OPENAI_ADMIN_KEY, used for usage/billing calls, not inference) was bound
++// as OPENAI_API_KEY on the DevOps agent, and from the next day every DevOps run was
++// filed as `openai` / `metered_api` — the class the ledger and the guardian check
++// treat as real per-token money. It is not: the codex homes' auth.json is a symlink
++// to /home/ubuntu/.codex/auth.json with `auth_mode: "chatgpt"`, no embedded API key,
++// and live rollouts carry a ChatGPT `plan_type: "pro"` rate-limit window. The runs
++// are on Waseem's Codex Pro subscription.
++// Fix: when the CODEX_HOME the run will actually use holds a ChatGPT login and no
++// embedded API key, classify the run as subscription/chatgpt regardless of what the
++// environment carries. A genuine API-key-only codex home still classifies as
++// metered_api. Local execution targets only — a remote target's auth is not here.
++// Backups: acp.js.pre-codex-billing-authmode-20260901,
++//          execute.js.pre-codex-billing-authmode-20260901
++function localPatchCodexHomeUsesChatgptAuth(env) {
++    try {
++        const configured = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim().length > 0
++            ? env.CODEX_HOME.trim()
++            : nodePath.join(nodeOs.homedir(), ".codex");
++        const raw = nodeReadFileSync(nodePath.join(configured, "auth.json"), "utf8");
++        const parsed = JSON.parse(raw);
++        if (!parsed || typeof parsed !== "object")
++            return false;
++        const embeddedKey = typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY.trim().length > 0;
++        if (embeddedKey)
++            return false;
++        const tokens = parsed.tokens;
++        const hasChatgptTokens = !!tokens
++            && typeof tokens === "object"
++            && typeof tokens.access_token === "string"
++            && tokens.access_token.trim().length > 0;
++        return parsed.auth_mode === "chatgpt" || hasChatgptTokens;
++    }
++    catch {
++        return false;
++    }
++}
++// END LOCAL PATCH 2026-09-01 (lane R3)
+ /**
+  * Classify billing the same way the Codex CLI lane does so ACP runs land in
+  * the cost ledger with a real provider/billingType instead of acpx/unknown.
+@@ -246,7 +289,10 @@
+         ...Object.fromEntries(Object.entries(envConfig).filter((entry) => typeof entry[1] === "string")),
+     };
+     const apiKey = typeof mergedEnv.OPENAI_API_KEY === "string" && mergedEnv.OPENAI_API_KEY.trim().length > 0;
+-    const billingType = apiKey ? "api" : "subscription";
++    // LOCAL PATCH 2026-09-01 (lane R3): an env key does not mean the run bills the API.
++    const billsApi = apiKey && !(considerHostEnv && localPatchCodexHomeUsesChatgptAuth(mergedEnv));
++    // END LOCAL PATCH 2026-09-01 (lane R3)
++    const billingType = billsApi ? "api" : "subscription";
+     const openAiCompatibleBiller = inferOpenAiCompatibleBiller(mergedEnv, "openai");
+     const biller = openAiCompatibleBiller === "openrouter"
+         ? "openrouter"
+--- adapter-codex-local/dist/server/execute.js.stock-backup
++++ adapter-codex-local/dist/server/execute.js
+@@ -1,3 +1,6 @@
++import { readFileSync as nodeReadFileSync } from "node:fs";
++import nodeOs from "node:os";
++import nodePath from "node:path";
+ import fs from "node:fs/promises";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+@@ -87,9 +90,55 @@
+     const raw = env[key];
+     return typeof raw === "string" && raw.trim().length > 0;
+ }
+-function resolveCodexBillingType(env) {
++// LOCAL PATCH 2026-09-01 (lane R3 — bill Codex by the auth it actually uses).
++// `resolveCodexBillingType` inferred API billing from the mere presence of an
++// OPENAI_API_KEY environment variable. On 2026-08-24 23:01 the OpenAI *admin* key
++// (bws AUT_OPENAI_ADMIN_KEY, used for usage/billing calls, not inference) was bound
++// as OPENAI_API_KEY on the DevOps agent, and from the next day every DevOps run was
++// filed as `openai` / `metered_api` — the class the ledger and the guardian check
++// treat as real per-token money. It is not: the codex homes' auth.json is a symlink
++// to /home/ubuntu/.codex/auth.json with `auth_mode: "chatgpt"`, no embedded API key,
++// and live rollouts carry a ChatGPT `plan_type: "pro"` rate-limit window. The runs
++// are on Waseem's Codex Pro subscription.
++// Fix: when the CODEX_HOME the run will actually use holds a ChatGPT login and no
++// embedded API key, classify the run as subscription/chatgpt regardless of what the
++// environment carries. A genuine API-key-only codex home still classifies as
++// metered_api. Local execution targets only — a remote target's auth is not here.
++// Backups: acp.js.pre-codex-billing-authmode-20260901,
++//          execute.js.pre-codex-billing-authmode-20260901
++function localPatchCodexHomeUsesChatgptAuth(env) {
++    try {
++        const configured = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim().length > 0
++            ? env.CODEX_HOME.trim()
++            : nodePath.join(nodeOs.homedir(), ".codex");
++        const raw = nodeReadFileSync(nodePath.join(configured, "auth.json"), "utf8");
++        const parsed = JSON.parse(raw);
++        if (!parsed || typeof parsed !== "object")
++            return false;
++        const embeddedKey = typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY.trim().length > 0;
++        if (embeddedKey)
++            return false;
++        const tokens = parsed.tokens;
++        const hasChatgptTokens = !!tokens
++            && typeof tokens === "object"
++            && typeof tokens.access_token === "string"
++            && tokens.access_token.trim().length > 0;
++        return parsed.auth_mode === "chatgpt" || hasChatgptTokens;
++    }
++    catch {
++        return false;
++    }
++}
++// END LOCAL PATCH 2026-09-01 (lane R3)
++function resolveCodexBillingType(env, allowLocalAuthProbe = true) {
+     // Codex uses API-key auth when OPENAI_API_KEY is present; otherwise rely on local login/session auth.
+-    return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
++    if (!hasNonEmptyEnvValue(env, "OPENAI_API_KEY"))
++        return "subscription";
++    // LOCAL PATCH 2026-09-01 (lane R3): an env key does not mean the run bills the API.
++    if (allowLocalAuthProbe && localPatchCodexHomeUsesChatgptAuth(env))
++        return "subscription";
++    // END LOCAL PATCH 2026-09-01 (lane R3)
++    return "api";
+ }
+ function resolveCodexBiller(env, billingType) {
+     const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, "openai");
+@@ -703,7 +752,7 @@
+             }
+         }
+         const effectiveEnv = Object.fromEntries(Object.entries({ ...process.env, ...env }).filter((entry) => typeof entry[1] === "string"));
+-        const billingType = resolveCodexBillingType(effectiveEnv);
++        const billingType = resolveCodexBillingType(effectiveEnv, !executionTargetIsRemote);
+         const networkScope = parseLocalProcessNetworkScope(config.networkScope);
+         const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+         const localProcessSandbox = (filesystemScope || networkScope) && !executionTargetIsRemote
