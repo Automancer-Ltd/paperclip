@@ -347,6 +347,15 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+
+export const INVOCATION_ADMISSION_DEFAULTS = {
+  maxStartsPerIssue: 6,
+  maxStartsPerCampaign: 24,
+  campaignBudgetMs: 45 * 60 * 1000,
+} as const;
+
+const INVOCATION_ADMISSION_CAMPAIGN_ID_KEY = "campaignId";
+const INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX = "paperclip:invocation-admission:";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -5399,6 +5408,12 @@ function enrichWakeContextSnapshot(input: {
   if (!readNonEmptyString(contextSnapshot["wakeSource"]) && source) {
     contextSnapshot.wakeSource = source;
   }
+  if (
+    !readNonEmptyString(contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY]) &&
+    readNonEmptyString(payload?.[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY])
+  ) {
+    contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = payload?.[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY];
+  }
   if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
   }
@@ -5508,6 +5523,9 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  if (readNonEmptyString(existing[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY])) {
+    merged[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = existing[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY];
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -12214,6 +12232,118 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  type InvocationAdmissionBlock = {
+    reason: "heartbeat.issue_invocation_limit" | "heartbeat.campaign_invocation_limit" | "heartbeat.campaign_budget_expired";
+    observed: number;
+    limit: number;
+    campaignId: string;
+    issueId: string | null;
+  };
+
+  async function getInvocationAdmissionBlock(
+    run: typeof heartbeatRuns.$inferSelect,
+    client: Pick<Db, "select">,
+    now = new Date(),
+  ): Promise<InvocationAdmissionBlock | null> {
+    const context = parseObject(run.contextSnapshot);
+    const campaignId = readNonEmptyString(context[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY]);
+    if (!campaignId) return null;
+
+    const campaignRows = await client
+      .select({
+        total: sql<number>`count(*)::integer`,
+        firstStartedAt: sql<Date | null>`min(${heartbeatRuns.startedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
+        sql`${heartbeatRuns.startedAt} is not null`,
+      ));
+    const campaignRow = campaignRows[0];
+    const campaignTotal = Number(campaignRow?.total ?? 0);
+    const campaignStartedAt = campaignRow?.firstStartedAt ? new Date(campaignRow.firstStartedAt) : null;
+    const issueId = readNonEmptyString(context.issueId);
+
+    if (
+      campaignStartedAt &&
+      now.getTime() - campaignStartedAt.getTime() >= INVOCATION_ADMISSION_DEFAULTS.campaignBudgetMs
+    ) {
+      return {
+        reason: "heartbeat.campaign_budget_expired",
+        observed: now.getTime() - campaignStartedAt.getTime(),
+        limit: INVOCATION_ADMISSION_DEFAULTS.campaignBudgetMs,
+        campaignId,
+        issueId,
+      };
+    }
+    if (campaignTotal >= INVOCATION_ADMISSION_DEFAULTS.maxStartsPerCampaign) {
+      return {
+        reason: "heartbeat.campaign_invocation_limit",
+        observed: campaignTotal,
+        limit: INVOCATION_ADMISSION_DEFAULTS.maxStartsPerCampaign,
+        campaignId,
+        issueId,
+      };
+    }
+
+    if (issueId) {
+      const issueRows = await client
+        .select({ total: sql<number>`count(*)::integer` })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.startedAt} is not null`,
+        ));
+      const issueTotal = Number(issueRows[0]?.total ?? 0);
+      if (issueTotal >= INVOCATION_ADMISSION_DEFAULTS.maxStartsPerIssue) {
+        return {
+          reason: "heartbeat.issue_invocation_limit",
+          observed: issueTotal,
+          limit: INVOCATION_ADMISSION_DEFAULTS.maxStartsPerIssue,
+          campaignId,
+          issueId,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function invocationAdmissionLockKey(run: typeof heartbeatRuns.$inferSelect) {
+    const campaignId = readNonEmptyString(parseObject(run.contextSnapshot)[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY]);
+    return campaignId ? `${INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX}${run.companyId}:${campaignId}` : null;
+  }
+
+  async function inheritInvocationAdmissionCampaignId(
+    companyId: string,
+    issueId: string,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    if (readNonEmptyString(contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY])) return;
+    const priorRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.startedAt} is not null`,
+        or(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}`,
+        ),
+        sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} is not null`,
+      ))
+      .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const campaignId = readNonEmptyString(
+      parseObject(priorRun?.contextSnapshot)[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY],
+    );
+    if (campaignId) contextSnapshot[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY] = campaignId;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -12568,18 +12698,75 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return null;
+    const admission = await db.transaction(async (tx) => {
+      const lockKey = invocationAdmissionLockKey(run);
+      if (lockKey) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      }
+
+      const admissionBlock = await getInvocationAdmissionBlock(run, tx, claimedAt);
+      if (admissionBlock) {
+        const reason = `Cancelled before adapter invocation because the ${admissionBlock.reason} admission cap was reached`;
+        const cancelled = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: claimedAt,
+            error: reason,
+            errorCode: admissionBlock.reason,
+            resultJson: {
+              ...parseObject(run.resultJson),
+              stopReason: admissionBlock.reason,
+              observed: admissionBlock.observed,
+              limit: admissionBlock.limit,
+              effectiveTimeoutSec: 0,
+              timeoutConfigured: false,
+              timeoutSource: "invocation_admission_gate",
+              timeoutFired: false,
+            },
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!cancelled) return { kind: "lost" as const, run: null, block: null };
+        if (cancelled.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({ status: "skipped", finishedAt: claimedAt, error: reason, updatedAt: claimedAt })
+            .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+        }
+        return { kind: "blocked" as const, run: cancelled, block: admissionBlock };
+      }
+
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return claimed
+        ? { kind: "claimed" as const, run: claimed, block: null }
+        : { kind: "lost" as const, run: null, block: null };
+    });
+    if (admission.kind === "lost") return null;
+    if (admission.kind === "blocked") {
+      await appendRunEvent(admission.run, await nextRunEventSeq(admission.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Run cancelled by the native invocation admission guard",
+        payload: admission.block,
+      });
+      await releaseIssueExecutionAndPromote(admission.run, { suppressImmediateRecovery: true });
+      return null;
+    }
+    const claimed = admission.run;
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -17563,6 +17750,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    if (issueId) await inheritInvocationAdmissionCampaignId(agent.companyId, issueId, enrichedContextSnapshot);
 
     const writeSkippedRequest = async (
       skipReason: string,

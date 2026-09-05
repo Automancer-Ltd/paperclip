@@ -10116,12 +10116,30 @@ export function issueRoutes(
       };
       const dependencyReadinessSvc = svc as DependencyReadinessProvider;
       const wakeups = new Map<string, { agentId: string; wakeup: WakeupRequest }>();
+      const actorCampaignId = actor.runId
+        ? await db
+            .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, actor.runId))
+            .then((rows) => readNonEmptyString(readObject(rows[0]?.contextSnapshot).campaignId))
+            .catch(() => null)
+        : null;
       const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
         const wakeIssueId =
           wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
             ? wakeup.payload.issueId
             : issue.id;
-        wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
+        const explicitCampaignId = readNonEmptyString(readObject(wakeup.contextSnapshot).campaignId)
+          ?? readNonEmptyString(readObject(wakeup.payload).campaignId);
+        const campaignId = wakeIssueId === issue.id ? explicitCampaignId ?? actorCampaignId : explicitCampaignId;
+        const enrichedWakeup = campaignId
+          ? {
+              ...wakeup,
+              payload: { ...readObject(wakeup.payload), campaignId },
+              contextSnapshot: { ...readObject(wakeup.contextSnapshot), campaignId },
+            }
+          : wakeup;
+        wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup: enrichedWakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
         agentId: string;
@@ -12087,14 +12105,25 @@ export function issueRoutes(
     void (async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
       const wakeups = new Map<string, { agentId: string; wakeup: WakeupRequest }>();
+      const commentCampaignId = readNonEmptyString(readObject(comment.metadata).campaignId);
       const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
         const wakeIssueId =
           wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
             ? wakeup.payload.issueId
             : currentIssue.id;
+        const explicitCampaignId = readNonEmptyString(readObject(wakeup.contextSnapshot).campaignId)
+          ?? readNonEmptyString(readObject(wakeup.payload).campaignId);
+        const campaignId = wakeIssueId === currentIssue.id ? explicitCampaignId ?? commentCampaignId : explicitCampaignId;
+        const enrichedWakeup = campaignId
+          ? {
+              ...wakeup,
+              payload: { ...readObject(wakeup.payload), campaignId },
+              contextSnapshot: { ...readObject(wakeup.contextSnapshot), campaignId },
+            }
+          : wakeup;
         const key = `${agentId}:${wakeIssueId}`;
         if (wakeups.has(key)) return;
-        wakeups.set(key, { agentId, wakeup });
+        wakeups.set(key, { agentId, wakeup: enrichedWakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
         agentId: string;

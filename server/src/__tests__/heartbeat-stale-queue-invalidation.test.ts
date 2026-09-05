@@ -409,6 +409,40 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThanOrEqual(now.getTime());
   });
 
+  it("inherits a prior issue campaign for assignment and comment-style wakes", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const campaignId = "acceptance-inherited-campaign";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Inherited campaign work",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "succeeded",
+      startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(),
+      contextSnapshot: { issueId, campaignId },
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId },
+    });
+
+    expect(run?.contextSnapshot).toMatchObject({ issueId, campaignId });
+    await heartbeat.drainActiveRunExecutions();
+  });
+
   it("allows generic timer wakes when the agent has assigned todo work", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
@@ -932,6 +966,148 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     expect(wakeup).toMatchObject({ status: "skipped" });
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("blocks the seventh queued start for one issue at the native admission seam", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
+    const issueId = randomUUID();
+    const campaignId = "acceptance-issue-cap";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capped issue work",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    for (let i = 0; i < 6; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        startedAt: new Date(Date.now() - 60_000),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId, campaignId },
+      });
+    }
+    const queued = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_continuation_needed",
+      invocationSource: "automation",
+      contextExtras: { campaignId },
+    });
+    await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queued.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "heartbeat.issue_invocation_limit" });
+    expect(run?.resultJson).toMatchObject({ stopReason: "heartbeat.issue_invocation_limit", observed: 6, limit: 6 });
+  });
+
+  it("blocks a campaign whose first started run is older than the budget window", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
+    const issueId = randomUUID();
+    const campaignId = "acceptance-budget-expired";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired campaign work",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "succeeded",
+      createdAt: new Date(Date.now() - 46 * 60_000),
+      startedAt: new Date(Date.now() - 46 * 60_000),
+      finishedAt: new Date(Date.now() - 45 * 60_000),
+      contextSnapshot: { issueId, campaignId },
+    });
+    const queued = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+      invocationSource: "assignment",
+      contextExtras: { campaignId },
+    });
+    await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queued.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "heartbeat.campaign_budget_expired" });
+    expect(run?.resultJson).toMatchObject({
+      stopReason: "heartbeat.campaign_budget_expired",
+      limit: 45 * 60 * 1000,
+    });
+  });
+
+  it("serializes concurrent campaign admissions so the campaign cap cannot be exceeded", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
+    const campaignId = "acceptance-campaign-cap";
+    for (let i = 0; i < 23; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        startedAt: new Date(Date.now() - 60_000),
+        finishedAt: new Date(),
+        contextSnapshot: { campaignId, issueId: randomUUID() },
+      });
+    }
+    const queued = [];
+    for (let i = 0; i < 2; i += 1) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Concurrent campaign issue ${i}`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+      const run = await seedQueuedRun({
+        companyId,
+        agentId,
+        issueId,
+        wakeReason: "issue_assigned",
+        invocationSource: "assignment",
+        contextExtras: { campaignId },
+      });
+      await db.update(issues).set({ executionRunId: run.runId }).where(eq(issues.id, issueId));
+      queued.push(run.runId);
+    }
+
+    await Promise.all([heartbeat.resumeQueuedRuns(), heartbeat.resumeQueuedRuns()]);
+    await heartbeat.drainActiveRunExecutions();
+
+    const rows = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.id} in (${sql.join(queued.map((id) => sql`${id}`), sql`, `)})`);
+    expect(rows.filter((row) => row.status === "running" || row.status === "succeeded")).toHaveLength(1);
+    expect(rows.filter((row) => row.errorCode === "heartbeat.campaign_invocation_limit")).toHaveLength(1);
   });
 
   it("promotes deferred issue wakes when a queued holder is cancelled by the daily run cap", async () => {

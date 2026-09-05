@@ -675,6 +675,7 @@ export const issueCommentMetadataSchema = z.object({
   version: z.literal(1),
   sourceRunId: z.string().uuid().nullable().optional(),
   authorizationReason: z.string().trim().min(1).max(160).nullable().optional(),
+  campaignId: z.string().trim().min(1).max(200).optional(),
   sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
 }).strict();
 

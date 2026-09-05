@@ -977,6 +977,53 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("propagates campaign metadata from a committed comment into its wake", async () => {
+    const issue = makeIssue("in_progress");
+    const campaignId = "acceptance-route-campaign";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-campaign",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "continue",
+      metadata: {
+        version: 1,
+        campaignId,
+        sections: [{
+          title: "Campaign admission",
+          rows: [{ type: "key_value", label: "Campaign ID", value: campaignId }],
+        }],
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({
+        body: "continue",
+        metadata: {
+          version: 1,
+          campaignId,
+          sections: [{
+            title: "Campaign admission",
+            rows: [{ type: "key_value", label: "Campaign ID", value: campaignId }],
+          }],
+        },
+      });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      issue.assigneeAgentId,
+      expect.objectContaining({
+        payload: expect.objectContaining({ campaignId }),
+        contextSnapshot: expect.objectContaining({ campaignId }),
+      }),
+    ));
+  });
+
   it("does not move scheduled-retry issues to todo when POST comment retry cancellation fails", async () => {
     const issue = {
       ...makeIssue("in_progress"),
