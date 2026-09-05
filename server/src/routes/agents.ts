@@ -3044,9 +3044,10 @@ export function agentRoutes(
         res.status(404).json({ error: "Revision not found" });
         return;
       }
-      for (const config of [existing.runtimeConfig, asRecord(revision.afterConfig)?.runtimeConfig]) {
-        const heartbeat = asRecord(asRecord(config)?.heartbeat);
-        if ((typeof heartbeat?.campaignId === "string" && heartbeat.campaignId.trim().length > 0) || heartbeat?.coordinationOnly === true) {
+      for (const config of [existing, asRecord(revision.afterConfig)]) {
+        const heartbeat = asRecord(asRecord(config?.runtimeConfig)?.heartbeat);
+        if ((typeof heartbeat?.campaignId === "string" && heartbeat.campaignId.trim().length > 0) ||
+          (config?.adapterType === "process" && heartbeat?.coordinationOnly === true)) {
           throw forbidden("Campaign actor configuration rollback is board-managed");
         }
       }
@@ -3775,7 +3776,7 @@ export function agentRoutes(
 
     const savedHeartbeat = asRecord(asRecord(existing.runtimeConfig)?.heartbeat);
     if (req.actor.type === "agent" && savedHeartbeat &&
-      ((typeof savedHeartbeat.campaignId === "string" && savedHeartbeat.campaignId.trim().length > 0) || savedHeartbeat.coordinationOnly === true) &&
+      ((typeof savedHeartbeat.campaignId === "string" && savedHeartbeat.campaignId.trim().length > 0) || (existing.adapterType === "process" && savedHeartbeat.coordinationOnly === true)) &&
       (hasOwn(req.body, "runtimeConfig") || hasOwn(req.body, "adapterType") || hasOwn(req.body, "adapterConfig"))) {
       throw forbidden("Campaign actor execution settings are board-managed");
     }

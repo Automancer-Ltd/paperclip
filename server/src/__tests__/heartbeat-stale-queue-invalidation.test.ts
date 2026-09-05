@@ -1142,16 +1142,23 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const gate = new Promise<void>(resolve => { release = resolve; });
     beforeInvocationBudget.mockImplementationOnce(async () => { reached(); await gate; });
     const claiming = heartbeat.resumeQueuedRuns();
+    let waking: ReturnType<typeof heartbeat.wakeup> | undefined;
     try {
       await fetched;
-      const coalesced = await heartbeat.wakeup(agentId, {
+      // wakeup commits the coalesced row, then waits for the same agent start lock
+      // held by claiming. Observe its committed write, not its final promise.
+      waking = heartbeat.wakeup(agentId, {
         source: "on_demand", triggerDetail: "manual", payload: { issueId, commentId },
       });
-      expect(coalesced?.id).toBe(queued.runId);
-      expect(coalesced?.contextSnapshot?.wakeCommentId).toBe(commentId);
+      expect(await waitForCondition(async () => {
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued.runId));
+        return row?.contextSnapshot?.wakeCommentId === commentId;
+      })).toBe(true);
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, queued.runId));
+      expect(wakeups.some(wake => wake.status === "coalesced")).toBe(true);
     } finally {
       release();
-      await claiming;
+      await Promise.all([claiming, waking]);
     }
     await heartbeat.drainActiveRunExecutions();
     const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued.runId));

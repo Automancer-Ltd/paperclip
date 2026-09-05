@@ -82,3 +82,21 @@ After the gate clears, follow `evening-estate-brief.md` and the preserved accept
 steps. Save exact actor objects securely, configure only four paused actors, read back,
 run the bounded test-repository cycle, then restore and re-read all objects. OFF remains
 present. No blind retry, other-company opt-in, shared policy activation or datastore restore.
+
+## Follow-up 2 — 2026-09-05
+
+Main's independent re-review of 5b99210 found no blockers and verified the ten ports
+hunk-by-hunk as a source-level superset. Main's typecheck passed; 73 tests passed,
+but the three new coalesced-wake regressions timed out. This was a test wait cycle:
+`enqueueWakeup` commits its `coalesced` transaction, then calls
+`startNextQueuedRunForAgent` before returning. The test awaited that return while
+holding the claim's existing per-agent start lock behind its budget gate.
+Neither the JSONB change nor the installed port added that lock acquisition.
+
+The corrected regression starts the wake without awaiting its completion, observes
+its committed comment and coalesced wake request through the database, releases the
+claim gate, and then awaits both operations. The test budget stays 15 seconds. No
+production admission code changed for this correction. Route coordination-only
+protection now applies only to process adapters, including the saved and restored
+adapter types in rollback. New route cases cover both process and model adapters.
+Main owns the rerun; no Vitest execution in this bounded lane session.

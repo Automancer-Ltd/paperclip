@@ -310,16 +310,31 @@ describe("agent routes adapter validation", () => {
     },
   );
 
+  it.each(["codex_local", "process"])("only process coordination locks adapter edits (%s)", async (adapterType) => {
+    const agent = { ...(await mockAgentService.getById()), adapterType,
+      runtimeConfig: { heartbeat: { coordinationOnly: true } } };
+    mockAgentService.getById.mockResolvedValue(agent);
+    const app = await createApp({ type: "agent", agentId: agent.id, companyId: agent.companyId, source: "agent_key" });
+    const res = await requestApp(app, baseUrl =>
+      request(baseUrl).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { timeoutSec: 180 } }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(adapterType === "process" ? 403 : 200);
+    if (adapterType === "process") expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
   it.each([
     { name: "ordinary configuration", saved: {}, restored: {}, status: 200 },
     { name: "cleared campaign", saved: { heartbeat: { campaignId: null, coordinationOnly: false } }, restored: {}, status: 200 },
     { name: "blank campaign", saved: { heartbeat: { campaignId: "  " } }, restored: {}, status: 200 },
     { name: "removing a campaign", saved: { heartbeat: { campaignId: "trusted" } }, restored: {}, status: 403 },
-    { name: "restoring campaign settings", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, status: 403 },
-  ])("scopes agent rollback protection to campaign settings: $name", async ({ saved, restored, status }) => {
-    const agent = { id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: saved };
+    { name: "restoring process coordination", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, restoredAdapterType: "process", status: 403 },
+    { name: "non-process coordination flag", saved: { heartbeat: { coordinationOnly: true } }, restored: {}, status: 200 },
+    { name: "restoring non-process coordination flag", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, status: 200 },
+    { name: "removing process coordination", saved: { heartbeat: { coordinationOnly: true } }, restored: {}, adapterType: "process", status: 403 },
+  ].map(entry => ({ adapterType: "codex_local", restoredAdapterType: "codex_local", ...entry })))("scopes agent rollback protection to campaign settings: $name", async ({ saved, restored, status, adapterType, restoredAdapterType }) => {
+    const agent = { id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: saved, adapterType };
     mockAgentService.getById.mockResolvedValue(agent);
-    mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: { runtimeConfig: restored } });
+    mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: { runtimeConfig: restored, adapterType: restoredAdapterType } });
     mockAgentService.rollbackConfigRevision.mockResolvedValue(agent);
     const app = await createApp({ type: "agent", agentId: agent.id, companyId: agent.companyId, source: "agent_key" });
     const res = await requestApp(app, baseUrl =>
