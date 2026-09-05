@@ -5517,6 +5517,12 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // Coalesced wakes cannot rewrite an already admitted native reservation.
+  if (existing.nativeCampaignAdmission === true) {
+    merged.campaignId = existing.campaignId;
+    merged.nativeCampaignAdmission = true;
+    merged.nativeModelReservation = existing.nativeModelReservation;
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
