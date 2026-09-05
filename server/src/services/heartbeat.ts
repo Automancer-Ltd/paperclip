@@ -12666,9 +12666,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const admission = await db.transaction(async (tx) => {
-      const heartbeatConfig = parseObject(parseObject(agent.runtimeConfig).heartbeat);
-      const campaignId = readNonEmptyString(heartbeatConfig.campaignId)?.trim() ?? null;
+    const heartbeatConfig = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+    const campaignId = readNonEmptyString(heartbeatConfig.campaignId)?.trim() ?? null;
+    const claim = async (tx: Pick<Db, "select" | "update" | "execute">) => {
       const admissionContext = { ...parseObject(run.contextSnapshot) };
       delete admissionContext.campaignId;
       delete admissionContext.admissionAdapterType;
@@ -12733,7 +12733,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return claimed
         ? { kind: "claimed" as const, run: claimed, block: null }
         : { kind: "lost" as const, run: null, block: null };
-    });
+    };
+    const admission = campaignId ? await db.transaction(claim) : await claim(db);
     if (admission.kind === "lost") return null;
     if (admission.kind === "blocked") {
       await appendRunEvent(admission.run, await nextRunEventSeq(admission.run.id), {

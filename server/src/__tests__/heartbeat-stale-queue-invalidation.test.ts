@@ -150,6 +150,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await heartbeat.drainActiveRunExecutions();
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -161,21 +162,6 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
     await cleanupHeartbeatInvalidationFixture(db);
   });
 
@@ -1020,7 +1006,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
 
-    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(countExecuteCallsForRun(queued.runId)).toBe(1);
     const [run] = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
       .from(heartbeatRuns)
@@ -1059,14 +1045,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       issueId,
       wakeReason: "issue_continuation_needed",
       invocationSource: "automation",
-      contextExtras: { campaignId: "untrusted-reset-attempt" },
+      contextExtras: { campaignId },
     });
     await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
 
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
 
-    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(countExecuteCallsForRun(queued.runId)).toBe(1);
     const [run] = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
       .from(heartbeatRuns)

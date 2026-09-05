@@ -9,6 +9,8 @@ const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
+  getConfigRevision: vi.fn(),
+  rollbackConfigRevision: vi.fn(),
 }));
 
 const mockAdapterPluginStore = vi.hoisted(() => ({
@@ -307,6 +309,23 @@ describe("agent routes adapter validation", () => {
       expect(mockAgentService.update).not.toHaveBeenCalled();
     },
   );
+
+  it.each([
+    { name: "ordinary configuration", saved: {}, restored: {}, status: 200 },
+    { name: "removing a campaign", saved: { heartbeat: { campaignId: "trusted" } }, restored: {}, status: 403 },
+    { name: "restoring campaign settings", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, status: 403 },
+  ])("scopes agent rollback protection to campaign settings: $name", async ({ saved, restored, status }) => {
+    const agent = { id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: saved };
+    mockAgentService.getById.mockResolvedValue(agent);
+    mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: { runtimeConfig: restored } });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(agent);
+    const app = await createApp({ type: "agent", agentId: agent.id, companyId: agent.companyId, source: "agent_key" });
+    const res = await requestApp(app, baseUrl =>
+      request(baseUrl).post(`/api/agents/${agent.id}/config-revisions/revision-1/rollback`),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+    if (status === 403) expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
 
   it("creates agents for dynamically registered external adapter types", async () => {
     const { registerServerAdapter } = await import("../adapters/index.js");

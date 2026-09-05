@@ -3033,12 +3033,24 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/config-revisions/:revisionId/rollback", async (req, res) => {
-    if (req.actor.type === "agent") throw forbidden("Configuration rollback is board-managed");
     const id = req.params.id as string;
     const revisionId = req.params.revisionId as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanUpdateAgent(req, existing);
+    if (req.actor.type === "agent") {
+      const revision = await svc.getConfigRevision(id, revisionId);
+      if (!revision) {
+        res.status(404).json({ error: "Revision not found" });
+        return;
+      }
+      for (const config of [existing.runtimeConfig, asRecord(revision.afterConfig)?.runtimeConfig]) {
+        const heartbeat = asRecord(asRecord(config)?.heartbeat);
+        if (heartbeat && (hasOwn(heartbeat, "campaignId") || hasOwn(heartbeat, "coordinationOnly"))) {
+          throw forbidden("Campaign actor configuration rollback is board-managed");
+        }
+      }
+    }
 
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
