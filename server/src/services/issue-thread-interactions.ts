@@ -2672,7 +2672,8 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         );
       });
 
-      if (superseded.length === 0) return [];
+      // One ambiguous comment must not expire multiple sibling confirmations.
+      if (superseded.length !== 1) return [];
 
       const now = new Date();
       const expired: IssueThreadInteraction[] = [];

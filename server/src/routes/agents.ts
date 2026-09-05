@@ -1705,6 +1705,11 @@ export function agentRoutes(
   }
 
   function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat);
+    if (req.actor.type === "agent" && heartbeat &&
+      (hasOwn(heartbeat, "campaignId") || hasOwn(heartbeat, "coordinationOnly"))) {
+      throw forbidden("Campaign admission settings are board-managed");
+    }
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
       assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
     }
@@ -3033,6 +3038,20 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanUpdateAgent(req, existing);
+    if (req.actor.type === "agent") {
+      const revision = await svc.getConfigRevision(id, revisionId);
+      if (!revision) {
+        res.status(404).json({ error: "Revision not found" });
+        return;
+      }
+      for (const config of [existing, asRecord(revision.afterConfig)]) {
+        const heartbeat = asRecord(asRecord(config?.runtimeConfig)?.heartbeat);
+        if ((typeof heartbeat?.campaignId === "string" && heartbeat.campaignId.trim().length > 0) ||
+          (config?.adapterType === "process" && heartbeat?.coordinationOnly === true)) {
+          throw forbidden("Campaign actor configuration rollback is board-managed");
+        }
+      }
+    }
 
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
@@ -3755,6 +3774,12 @@ export function agentRoutes(
       return;
     }
 
+    const savedHeartbeat = asRecord(asRecord(existing.runtimeConfig)?.heartbeat);
+    if (req.actor.type === "agent" && savedHeartbeat &&
+      ((typeof savedHeartbeat.campaignId === "string" && savedHeartbeat.campaignId.trim().length > 0) || (existing.adapterType === "process" && savedHeartbeat.coordinationOnly === true)) &&
+      (hasOwn(req.body, "runtimeConfig") || hasOwn(req.body, "adapterType") || hasOwn(req.body, "adapterConfig"))) {
+      throw forbidden("Campaign actor execution settings are board-managed");
+    }
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;

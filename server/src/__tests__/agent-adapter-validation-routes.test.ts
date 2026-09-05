@@ -9,6 +9,8 @@ const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
+  getConfigRevision: vi.fn(),
+  rollbackConfigRevision: vi.fn(),
 }));
 
 const mockAdapterPluginStore = vi.hoisted(() => ({
@@ -145,7 +147,7 @@ const externalAdapter: ServerAdapterModule = {
 
 const missingAdapterType = "missing_adapter_validation_test";
 
-async function createApp() {
+async function createApp(actor?: Record<string, unknown>) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -153,7 +155,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -296,6 +298,50 @@ describe("agent routes adapter validation", () => {
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
+  });
+
+  it.each([{ heartbeat: { campaignId: "reset" } }, { heartbeat: { coordinationOnly: true } }, {}])(
+    "refuses agent edits to a saved campaign even when config permissions allow them (%j)", async (runtimeConfig) => {
+      mockAgentService.getById.mockResolvedValue({ id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: { heartbeat: { campaignId: "trusted" } } });
+      const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_key" });
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ runtimeConfig }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["codex_local", "process"])("only process coordination locks adapter edits (%s)", async (adapterType) => {
+    const agent = { ...(await mockAgentService.getById()), adapterType,
+      runtimeConfig: { heartbeat: { coordinationOnly: true } } };
+    mockAgentService.getById.mockResolvedValue(agent);
+    const app = await createApp({ type: "agent", agentId: agent.id, companyId: agent.companyId, source: "agent_key" });
+    const res = await requestApp(app, baseUrl =>
+      request(baseUrl).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { timeoutSec: 180 } }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(adapterType === "process" ? 403 : 200);
+    if (adapterType === "process") expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "ordinary configuration", saved: {}, restored: {}, status: 200 },
+    { name: "cleared campaign", saved: { heartbeat: { campaignId: null, coordinationOnly: false } }, restored: {}, status: 200 },
+    { name: "blank campaign", saved: { heartbeat: { campaignId: "  " } }, restored: {}, status: 200 },
+    { name: "removing a campaign", saved: { heartbeat: { campaignId: "trusted" } }, restored: {}, status: 403 },
+    { name: "restoring process coordination", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, restoredAdapterType: "process", status: 403 },
+    { name: "non-process coordination flag", saved: { heartbeat: { coordinationOnly: true } }, restored: {}, status: 200 },
+    { name: "restoring non-process coordination flag", saved: {}, restored: { heartbeat: { coordinationOnly: true } }, status: 200 },
+    { name: "removing process coordination", saved: { heartbeat: { coordinationOnly: true } }, restored: {}, adapterType: "process", status: 403 },
+  ].map(entry => ({ adapterType: "codex_local", restoredAdapterType: "codex_local", ...entry })))("scopes agent rollback protection to campaign settings: $name", async ({ saved, restored, status, adapterType, restoredAdapterType }) => {
+    const agent = { id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", runtimeConfig: saved, adapterType };
+    mockAgentService.getById.mockResolvedValue(agent);
+    mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: { runtimeConfig: restored, adapterType: restoredAdapterType } });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(agent);
+    const app = await createApp({ type: "agent", agentId: agent.id, companyId: agent.companyId, source: "agent_key" });
+    const res = await requestApp(app, baseUrl =>
+      request(baseUrl).post(`/api/agents/${agent.id}/config-revisions/revision-1/rollback`),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+    if (status === 403) expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
   it("creates agents for dynamically registered external adapter types", async () => {

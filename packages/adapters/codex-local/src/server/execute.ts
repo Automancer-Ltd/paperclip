@@ -1,3 +1,30 @@
+import { readFileSync as nodeReadFileSync } from "node:fs";
+import nodeOs from "node:os";
+import nodePath from "node:path";
+function localPatchCodexHomeUsesChatgptAuth(env: NodeJS.ProcessEnv): boolean {
+    try {
+        const configured = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim().length > 0
+            ? env.CODEX_HOME.trim()
+            : nodePath.join(nodeOs.homedir(), ".codex");
+        const raw = nodeReadFileSync(nodePath.join(configured, "auth.json"), "utf8");
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object")
+            return false;
+        const embeddedKey = typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY.trim().length > 0;
+        if (embeddedKey)
+            return false;
+        const tokens = parsed.tokens;
+        const hasChatgptTokens = !!tokens
+            && typeof tokens === "object"
+            && typeof tokens.access_token === "string"
+            && tokens.access_token.trim().length > 0;
+        return parsed.auth_mode === "chatgpt" || hasChatgptTokens;
+    }
+    catch {
+        return false;
+    }
+}
+
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -185,9 +212,10 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
+function resolveCodexBillingType(env: Record<string, string>, allowLocalAuthProbe = true): "api" | "subscription" {
   // Codex uses API-key auth when OPENAI_API_KEY is present; otherwise rely on local login/session auth.
-  return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
+  return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") &&
+    !(allowLocalAuthProbe && localPatchCodexHomeUsesChatgptAuth(env)) ? "api" : "subscription";
 }
 
 function resolveCodexBiller(env: Record<string, string>, billingType: "api" | "subscription"): string {
@@ -966,7 +994,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const billingType = resolveCodexBillingType(effectiveEnv);
+    const billingType = resolveCodexBillingType(effectiveEnv, !executionTargetIsRemote);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
     const localProcessSandbox: LocalProcessSandboxOptions | null =

@@ -4367,6 +4367,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           title: agents.title,
           status: agents.status,
           reportsTo: agents.reportsTo,
+          adapterType: agents.adapterType,
+          adapterConfig: agents.adapterConfig,
         })
         .from(agents),
       db
@@ -4961,6 +4963,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
       return { kind: "skipped" as const };
     }
+
+        const LOCAL_PATCH_LIVE_SOURCE_STATUSES = ["todo", "in_progress", "in_review", "blocked"];
+        if (!LOCAL_PATCH_LIVE_SOURCE_STATUSES.includes(issue.status)) {
+            return { kind: "skipped" as const };
+        }
+        const LOCAL_PATCH_MAX_ESCALATIONS_PER_INCIDENT = 3;
+        if (input.finding.incidentKey) {
+            const localPatchPriorEscalations = await db
+                .select({ n: sql `count(*)::int` })
+                .from(issues)
+                .where(and(eq(issues.companyId, issue.companyId), eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation), eq(issues.originId, input.finding.incidentKey)))
+                .then((rows) => Number(rows[0]?.n ?? 0));
+            if (localPatchPriorEscalations >= LOCAL_PATCH_MAX_ESCALATIONS_PER_INCIDENT) {
+                logger.warn({
+                    companyId: issue.companyId,
+                    issueId: issue.id,
+                    incidentKey: input.finding.incidentKey,
+                    priorEscalations: localPatchPriorEscalations,
+                }, "liveness re-escalation ceiling reached; not minting another escalation");
+                return { kind: "skipped" as const };
+            }
+        }
 
     const recoveryIssue = await db
       .select()

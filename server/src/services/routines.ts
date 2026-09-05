@@ -1459,6 +1459,40 @@ export function routineService(
     );
   }
 
+    const LOCAL_PATCH_DEFERRABLE_WAKE_REASONS = new Set([
+        "paused",
+        "pending_approval",
+        "unknown_status",
+    ]);
+    function localPatchDeferrableWakeRefusal(error: unknown) {
+        if (!error || typeof error !== "object")
+            return null;
+        if (!("status" in error) || error.status !== 409)
+            return null;
+        const details = ("details" in error && error.details && typeof error.details === "object" ? error.details : {}) as Record<string, unknown>;
+        const reason = typeof details.reason === "string" ? details.reason : null;
+        if (reason && LOCAL_PATCH_DEFERRABLE_WAKE_REASONS.has(reason) && !details.invalidOrgChain)
+            return reason;
+        if (typeof details.scopeType === "string")
+            return "budget_blocked";
+        return null;
+    }
+    // An open execution issue for this routine that no heartbeat run has ever
+    // referenced: it was created by a dispatch whose wake was deferred and is still
+    // waiting to be picked up. Coalesce onto it instead of creating another.
+    async function findDeferredExecutionIssue(routine: typeof routines.$inferSelect, executor: Db = db, dispatchFingerprint?: string | null, origin?: { kind: string; id: string | null }) {
+        const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+        const originKind = origin?.kind ?? "routine_execution";
+        const originId = origin?.id ?? routine.id;
+        return executor
+            .select()
+            .from(issues)
+            .where(and(eq(issues.companyId, routine.companyId), eq(issues.originKind, originKind), eq(issues.originId, originId), inArray(issues.status, OPEN_ISSUE_STATUSES), visibleIssueCondition(), sql `not exists (select 1 from heartbeat_runs hr where hr.company_id = ${issues.companyId} and hr.context_snapshot ->> 'issueId' = cast(${issues.id} as text))`, ...(fingerprintCondition ? [fingerprintCondition] : [])))
+            .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+    }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1810,10 +1844,13 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = (await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
-        });
+        })) ?? (input.routine.concurrencyPolicy === "always_enqueue" ? null :
+          await findDeferredExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+            kind: issueOriginKind, id: issueOriginId,
+          }));
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
@@ -1909,6 +1946,7 @@ export function routineService(
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+        try {
         await queueIssueAssignmentWakeup({
           heartbeat,
           issue: createdIssue,
@@ -1918,6 +1956,13 @@ export function routineService(
           requestedByActorType: input.source === "schedule" ? "system" : undefined,
           rethrowOnError: true,
         });
+        } catch (wakeError) {
+          const deferralReason = localPatchDeferrableWakeRefusal(wakeError);
+          if (!deferralReason) throw wakeError;
+          logger.warn({ routineId: input.routine.id, runId: createdRun.id,
+            issueId: createdIssue.id, assigneeAgentId: assigneeAgentId ?? null, deferralReason,
+          }, "routine dispatch deferred: assignee could not be woken, issue kept for pickup when it can run");
+        }
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,

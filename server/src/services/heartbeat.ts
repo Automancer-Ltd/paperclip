@@ -347,6 +347,15 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+
+export const INVOCATION_ADMISSION_DEFAULTS = {
+  maxStartsPerIssue: 6,
+  maxStartsPerCampaign: 24,
+  campaignBudgetMs: 45 * 60 * 1000,
+} as const;
+
+const INVOCATION_ADMISSION_CAMPAIGN_ID_KEY = "campaignId";
+const INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX = "paperclip:invocation-admission:";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -4392,7 +4401,8 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    (input.issueExecutionWorkspacePreference === "reuse_existing" ||
+      input.issueExecutionWorkspacePreference === "isolated_workspace") && requestedExecutionWorkspaceId !== null;
 
   return {
     requestedExecutionWorkspaceId,
@@ -4450,6 +4460,7 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
 
 export async function provisionExecutionWorkspaceForFreshnessDecision<T extends { warnings?: string[] }>(input: {
   requestedShouldReuseExisting: boolean;
+  reuseIsOptional?: boolean;
   existingExecutionWorkspaceId?: string | null;
   issueRef: WorkspaceReuseIssueRef;
   runId: string;
@@ -4493,6 +4504,15 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
     });
   }
 
+  // Isolated reuse is optional when the old workspace is gone, never when restoration threw.
+  if (!restored && !reuseFailure && input.reuseIsOptional === true) {
+    const executionWorkspace = await input.realizeWorkspace();
+    return { executionWorkspace, reusedExecutionWorkspace: null,
+      policy: resolveExecutionWorkspaceReuseProvisioningPolicy({
+        requestedShouldReuseExisting: false, workspaceConfigFreshness: input.workspaceConfigFreshness,
+      }),
+    };
+  }
   if (!restored) {
     reuseFailure = reuseFailure ?? formatInheritedExecutionWorkspaceReuseFailure({
       reason: "inherited_workspace_reuse_unavailable",
@@ -5508,6 +5528,12 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // Coalesced wakes cannot rewrite an already admitted native reservation.
+  if (existing.nativeCampaignAdmission === true) {
+    merged.campaignId = existing.campaignId;
+    merged.nativeCampaignAdmission = true;
+    merged.nativeModelReservation = existing.nativeModelReservation;
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -12214,6 +12240,89 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  type InvocationAdmissionBlock = {
+    reason: "heartbeat.issue_invocation_limit" | "heartbeat.campaign_invocation_limit" | "heartbeat.campaign_budget_expired";
+    observed: number;
+    limit: number;
+    campaignId: string;
+    issueId: string | null;
+  };
+
+  async function getInvocationAdmissionBlock(
+    run: typeof heartbeatRuns.$inferSelect,
+    client: Pick<Db, "select">,
+    now = new Date(),
+  ): Promise<InvocationAdmissionBlock | null> {
+    const context = parseObject(run.contextSnapshot);
+    const campaignId = readNonEmptyString(context[INVOCATION_ADMISSION_CAMPAIGN_ID_KEY]);
+    if (!campaignId) return null;
+
+    const campaignRows = await client
+      .select({
+        total: sql<number>`count(*) filter (where ${heartbeatRuns.contextSnapshot}->>'nativeModelReservation' = 'true')::integer`,
+        firstStartedAt: sql<Date | null>`min(${heartbeatRuns.startedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'nativeCampaignAdmission' = 'true'`,
+        sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
+        sql`${heartbeatRuns.startedAt} is not null`,
+      ));
+    const campaignRow = campaignRows[0];
+    const campaignTotal = Number(campaignRow?.total ?? 0);
+    const campaignStartedAt = campaignRow?.firstStartedAt ? new Date(campaignRow.firstStartedAt) : null;
+    const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+
+    if (
+      campaignStartedAt &&
+      now.getTime() - campaignStartedAt.getTime() >= INVOCATION_ADMISSION_DEFAULTS.campaignBudgetMs
+    ) {
+      return {
+        reason: "heartbeat.campaign_budget_expired",
+        observed: now.getTime() - campaignStartedAt.getTime(),
+        limit: INVOCATION_ADMISSION_DEFAULTS.campaignBudgetMs,
+        campaignId,
+        issueId,
+      };
+    }
+    if (context.nativeModelReservation !== true) return null;
+    if (campaignTotal >= INVOCATION_ADMISSION_DEFAULTS.maxStartsPerCampaign) {
+      return {
+        reason: "heartbeat.campaign_invocation_limit",
+        observed: campaignTotal,
+        limit: INVOCATION_ADMISSION_DEFAULTS.maxStartsPerCampaign,
+        campaignId,
+        issueId,
+      };
+    }
+
+    if (issueId) {
+      const issueRows = await client
+        .select({ total: sql<number>`count(*)::integer` })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'nativeModelReservation' = 'true'`,
+          sql`${heartbeatRuns.contextSnapshot} ->> ${INVOCATION_ADMISSION_CAMPAIGN_ID_KEY} = ${campaignId}`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
+          sql`${heartbeatRuns.startedAt} is not null`,
+        ));
+      const issueTotal = Number(issueRows[0]?.total ?? 0);
+      if (issueTotal >= INVOCATION_ADMISSION_DEFAULTS.maxStartsPerIssue) {
+        return {
+          reason: "heartbeat.issue_invocation_limit",
+          observed: issueTotal,
+          limit: INVOCATION_ADMISSION_DEFAULTS.maxStartsPerIssue,
+          campaignId,
+          issueId,
+        };
+      }
+    }
+
+    return null;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -12568,18 +12677,92 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return null;
+    const heartbeatConfig = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+    const campaignId = readNonEmptyString(heartbeatConfig.campaignId)?.trim() ?? null;
+    const claim = async (tx: Pick<Db, "select" | "update" | "execute">) => {
+      const admissionFlags: Record<string, unknown> = {};
+      if (campaignId) {
+        admissionFlags.campaignId = campaignId;
+        admissionFlags.nativeCampaignAdmission = true;
+        admissionFlags.nativeModelReservation = !(agent.adapterType === "process" && heartbeatConfig.coordinationOnly === true);
+        const lockKey = `${INVOCATION_ADMISSION_CAMPAIGN_LOCK_PREFIX}${run.companyId}:${campaignId}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      }
+      const admissionContext = { ...parseObject(run.contextSnapshot) };
+      for (const key of ["campaignId", "admissionAdapterType", "nativeCampaignAdmission", "nativeModelReservation"]) {
+        delete admissionContext[key];
+      }
+      run = { ...run, contextSnapshot: { ...admissionContext, ...admissionFlags } };
+      // Coalesced wakes can update the row after it was fetched. Only replace our flags.
+      const currentAdmissionContext = sql`(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb)
+        - 'campaignId' - 'admissionAdapterType' - 'nativeCampaignAdmission' - 'nativeModelReservation')
+        || ${JSON.stringify(admissionFlags)}::jsonb`;
+      const admissionBlock = await getInvocationAdmissionBlock(run, tx, new Date());
+      if (admissionBlock) {
+        const reason = `Cancelled before adapter invocation because the ${admissionBlock.reason} admission cap was reached`;
+        const cancelled = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            contextSnapshot: currentAdmissionContext,
+            finishedAt: claimedAt,
+            error: reason,
+            errorCode: admissionBlock.reason,
+            resultJson: {
+              ...parseObject(run.resultJson),
+              stopReason: admissionBlock.reason,
+              observed: admissionBlock.observed,
+              limit: admissionBlock.limit,
+              effectiveTimeoutSec: 0,
+              timeoutConfigured: false,
+              timeoutSource: "invocation_admission_gate",
+              timeoutFired: false,
+            },
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!cancelled) return { kind: "lost" as const, run: null, block: null };
+        if (cancelled.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({ status: "skipped", finishedAt: claimedAt, error: reason, updatedAt: claimedAt })
+            .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+        }
+        return { kind: "blocked" as const, run: cancelled, block: admissionBlock };
+      }
+
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          contextSnapshot: currentAdmissionContext,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return claimed
+        ? { kind: "claimed" as const, run: claimed, block: null }
+        : { kind: "lost" as const, run: null, block: null };
+    };
+    const admission = campaignId ? await db.transaction(claim) : await claim(db);
+    if (admission.kind === "lost") return null;
+    if (admission.kind === "blocked") {
+      await appendRunEvent(admission.run, await nextRunEventSeq(admission.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Run cancelled by the native invocation admission guard",
+        payload: admission.block,
+      });
+      await releaseIssueExecutionAndPromote(admission.run, { suppressImmediateRecovery: true });
+      return null;
+    }
+    const claimed = admission.run;
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -14862,6 +15045,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
+        reuseIsOptional: issueRef?.executionWorkspacePreference !== "reuse_existing",
         existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
         issueRef,
         runId: run.id,
@@ -15095,9 +15279,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (issueId && persistedExecutionWorkspace) {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
       const shouldSwitchIssueToExistingWorkspace =
-        issueRef?.executionWorkspacePreference === "reuse_existing" ||
-        requestedExecutionWorkspaceMode === "isolated_workspace" ||
-        requestedExecutionWorkspaceMode === "operator_branch";
+        issueRef?.executionWorkspacePreference === "reuse_existing";
       const nextIssuePatch: Record<string, unknown> = {};
       if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
         nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
@@ -17568,6 +17750,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
+      // Preserve the installed terminal wake guard and one-hour skipped-wake throttle.
+            if (issueId && isUuidLike(issueId) && opts.requestedByActorType !== "user") {
+                const localPatchIssueStatus = await db
+                    .select({ status: issues.status })
+                    .from(issues)
+                    .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)))
+                    .then((rows) => rows[0]?.status ?? null);
+                if (localPatchIssueStatus === "done" || localPatchIssueStatus === "cancelled") {
+                    return;
+                }
+                const localPatchRecentSkip = await db
+                    .select({ id: agentWakeupRequests.id })
+                    .from(agentWakeupRequests)
+                    .where(and(eq(agentWakeupRequests.companyId, agent.companyId), sql `${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`, eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, skipReason), gte(agentWakeupRequests.createdAt, new Date(Date.now() - 60 * 60 * 1000))))
+                    .limit(1)
+                    .then((rows) => rows[0] ?? null);
+                if (localPatchRecentSkip) {
+                    return;
+                }
+            }
+
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
