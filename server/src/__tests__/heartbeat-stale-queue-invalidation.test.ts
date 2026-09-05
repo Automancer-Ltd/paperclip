@@ -1014,6 +1014,51 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.resultJson).toMatchObject({ stopReason: "heartbeat.issue_invocation_limit", observed: 6, limit: 6 });
   });
 
+  it("does not charge process coordination against a model slot", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
+    const issueId = randomUUID();
+    const campaignId = "acceptance-issue-cap";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capped issue work",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    for (let i = 0; i < 6; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        startedAt: new Date(Date.now() - 60_000),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId, campaignId, admissionAdapterType: i === 0 ? "process" : "codex_local" },
+      });
+    }
+    const queued = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_continuation_needed",
+      invocationSource: "automation",
+      contextExtras: { campaignId: "untrusted-reset-attempt" },
+    });
+    await db.update(issues).set({ executionRunId: queued.runId }).where(eq(issues.id, issueId));
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queued.runId));
+    expect(run?.status).toBe("succeeded");
+  });
+
   it("blocks a campaign whose first started run is older than the budget window", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 1 });
     const issueId = randomUUID();
