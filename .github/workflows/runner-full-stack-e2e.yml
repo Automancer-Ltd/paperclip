@@ -52,7 +52,7 @@ jobs:
   authorize:
     name: Authorize paid campaign
     if: github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -125,7 +125,7 @@ jobs:
           AWS_PAID_RUNNER_ENABLED: ${{ vars.RUNNER_E2E_AWS_ENABLED }}
         run: |
           set -euo pipefail
-          github_runner='ubuntu-latest'
+          github_runner='ubuntu-24.04'
           aws_runner='runs-on/fleet=paperclip-public-pr-x64/env=public-ci'
 
           if [ "$AWS_PAID_RUNNER_ENABLED" = true ]; then
@@ -149,7 +149,7 @@ jobs:
   target_lock:
     name: Resolve target pnpm lockfile
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -201,7 +201,7 @@ jobs:
     name: Validate catalog and select cells
     needs: [authorize, target_lock]
     if: github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -343,7 +343,7 @@ jobs:
   daytona_image:
     name: Publish verified Daytona image
     needs: [authorize, target_lock, catalog]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -610,7 +610,7 @@ jobs:
     needs:
       [authorize, target_lock, catalog, daytona_image, build_runner_artifacts]
     if: github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -997,7 +997,7 @@ jobs:
     needs: [authorize, catalog, daytona_image, test]
     outputs:
       history_source_ready: ${{ steps.history_source_ready.outputs.ready }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       actions: read
@@ -1135,7 +1135,7 @@ jobs:
     name: Publish S3 history and Pages bundle with declared screenshots
     needs: [authorize, catalog, report]
     if: always() && needs.catalog.result == 'success' && needs.report.outputs.history_source_ready == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       pages_artifact_name: ${{ steps.pages_artifact_name.outputs.name }}
@@ -1207,7 +1207,7 @@ jobs:
     name: Publish latest dashboard with declared screenshots
     needs: [report, publish_history]
     if: always() && needs.report.outputs.history_source_ready == 'true' && needs.publish_history.result == 'success' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pages: write
       id-token: write
