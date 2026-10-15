@@ -10,5 +10,5 @@ permissions:
 
 jobs:
   ci:
-    # Pin: #12858 merge — docker context integrity gate + traceability context fix.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@03609aa6ecc9a047ed53d6b6469d8be554fbc46d
+    # Keep runner policy local so upstream image aliases cannot drift this fork.
+    uses: ./.github/workflows/pr-trusted.yml
