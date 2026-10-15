@@ -10,5 +10,6 @@ permissions:
 
 jobs:
   ci:
-    # Keep runner policy local so upstream image aliases cannot drift this fork.
-    uses: ./.github/workflows/pr-trusted.yml
+    # Own reviewed runner-policy snapshot; retain the immutable trust boundary.
+    # Based on upstream 03609aa6ecc9a047ed53d6b6469d8be554fbc46d.
+    uses: Automancer-Ltd/paperclip/.github/workflows/pr-trusted.yml@14b4baa0556978678d512a19b562152d57446b64
