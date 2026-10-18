@@ -13,7 +13,7 @@ jobs:
   authorize:
     name: Authorize paid campaign
     if: github.event_name != 'schedule' || vars.RUNNER_LIVE_EVALS_NIGHTLY_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -54,7 +54,7 @@ jobs:
     name: Balanced provider/model matrix
     needs: authorize
     if: github.event_name != 'schedule' || vars.RUNNER_LIVE_EVALS_NIGHTLY_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
       contents: read

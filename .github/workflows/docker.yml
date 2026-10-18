@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -221,7 +221,7 @@ jobs:
   # separate runner, so this one carries its own copy of the prep steps
   # (checkout through schema labels) — the accepted cost of that isolation.
   build-and-push-cloud:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
