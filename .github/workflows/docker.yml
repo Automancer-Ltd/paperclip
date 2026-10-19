@@ -28,7 +28,15 @@ concurrency:
 jobs:
   build-and-push:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # This job publishes the multi-arch image (linux/amd64 + linux/arm64), and
+    # the arm64 half builds under emulation on an amd64 runner. Measured on this
+    # fork's first cache-cold run (actions/runs/39177722165, 18 Oct 2026): the
+    # arm64 runner-core cargo build alone needs about 94 minutes, against about
+    # 10 minutes for amd64, so a cache-cold job needs roughly two hours. Warm
+    # registry layers make the same build far shorter; this budget only has to
+    # cover a run that starts without them. The cloud job below stays at 60
+    # minutes because it publishes the amd64 variant only.
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v7
