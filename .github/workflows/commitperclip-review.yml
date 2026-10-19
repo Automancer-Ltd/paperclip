@@ -6,6 +6,13 @@ on:
 
 # Always runs from base branch context — never executes PR code.
 # pull_request_target gives access to secrets for untrusted fork PRs.
+#
+# The commitperclip gates need the commitperclip GitHub App (app id 3718661,
+# owned by paperclipai) installed on this repository plus its private key in the
+# COMMITPERCLIP_KEY secret. A fork that has neither (Automancer-Ltd/paperclip)
+# cannot mint an installation token, so those gates are skipped with a notice
+# instead of failing on every pull request. Dependency Review is independent and
+# always runs.
 
 permissions:
   pull-requests: write
@@ -33,18 +40,47 @@ jobs:
         with:
           node-version: '24'
 
+      # The `secrets` context is not available to `if:` expressions, so the
+      # secret is read once here and published as a step output the later steps
+      # gate on. Kept step-scoped (never job-scoped) so the value is not handed
+      # to unrelated actions.
+      - name: Check for a commitperclip key
+        id: key
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+        run: |
+          if [ -n "$COMMITPERCLIP_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "COMMITPERCLIP_KEY is set: running the commitperclip quality gates."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=commitperclip review skipped::COMMITPERCLIP_KEY is not set on $GITHUB_REPOSITORY, so the commitperclip quality gates (PR template, linked issue, dedup search, test coverage, lockfile, dependencies, release bootstrap, co-authors) did not run. Dependency Review above still ran. Set the repository secret to enable them."
+            {
+              echo "### commitperclip review skipped"
+              echo ""
+              echo "The commitperclip quality gates did not run: \`COMMITPERCLIP_KEY\` is not configured on this repository,"
+              echo "so no commitperclip GitHub App installation token can be minted. The \`Dependency Review\` step above still ran."
+              echo ""
+              echo "To enable the remaining gates, install the [commitperclip app](https://github.com/apps/commitperclip)"
+              echo "on this repository and set the \`COMMITPERCLIP_KEY\` repository secret to its private key."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Generate commitperclip token
         id: token
+        if: steps.key.outputs.present == 'true'
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
-          echo "value=$TOKEN" >> $GITHUB_OUTPUT
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: >-
+          steps.key.outputs.present == 'true' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
@@ -56,6 +92,7 @@ jobs:
 
       - name: Fail if quality gates failed
         if: >-
+          steps.key.outputs.present == 'true' &&
           github.event.pull_request.user.login != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         run: |
