@@ -19,7 +19,7 @@ test("release workflow delegates stable and canary verification to the reusable 
 
   assert.match(
     releaseWorkflow,
-    /verify_canary:\n\s+if: github\.event_name == 'push'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/,
+    /verify_canary:\n\s+if: github\.event_name == 'push'(?: && github\.repository == 'paperclipai/paperclip')?\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/,
   );
   // The stable lane is gated on the stable channel since the nightly lane
   // was added; a `needs:` line (for example a preflight job) may sit between
