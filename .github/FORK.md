@@ -21,6 +21,11 @@ Read `CONTRIBUTING.md` and `AGENTS.md` for the upstream rules. They still apply 
   the quality-gate step and the failure step, and it writes a notice that names the gates that did not
   run. The `Dependency Review` step is independent of the key and still runs.
 
+- **Release workflow.** The automatic canary (push to master) and nightly (schedule) publish jobs run only on
+  `paperclipai/paperclip`. They publish `@paperclipai/*` to npm by trusted publishing, which belongs to the
+  upstream repository. This fork has no npm access, so those jobs failed with ENEEDAUTH on every push.
+  Manual beta and stable dispatches are unchanged.
+
 ## Turn the commitperclip gates on
 
 1. Install the [commitperclip app](https://github.com/apps/commitperclip) on this repository.

@@ -65,13 +65,13 @@ env:
 
 jobs:
   verify_canary:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     uses: ./.github/workflows/release-verify.yml
     with:
       ref: ${{ github.sha }}
 
   publish_canary:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -198,7 +198,7 @@ jobs:
   # canary publish, so the nightly publish skips re-verification.
 
   select_nightly:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
+    if: github.repository == 'paperclipai/paperclip' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
